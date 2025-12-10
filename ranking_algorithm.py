@@ -776,132 +776,171 @@ class Anan_Strategy(RankingStrategy):
 
 @register_strategy("Yomna_Strategy")
 class Yomna_Strategy(RankingStrategy):
-  """using constraint optimization and adaptive learning"""
-  def __init__(self, exploration_rate: float = 0.03):
-    self.exploration_rate = exploration_rate
-    self.performance_history = []
+    """
+    Trust-first, value-aware strategy with structured tiers and simple exploration.
+    No adaptive NearOptimal logic; fixed weights, hard safety gates, and lightweight personalization.
+    """
 
-  def select_stores(self, customer: Customer, n: int, all_stores: List[Restaurant], t: int = 0) -> List[Restaurant]:
-    """ select stores using near-optimal constraint optimization"""
-    if not all_stores:
-      return []
-    
-    available = [s for s in all_stores if s.est_inventory > s.reservation_count]
-    if not available:
-        available = all_stores
-    
-    if len(available) <= n:
-      return available[:n]
+    def __init__(self, explore_rate: float = 0.05, enable_personalization: bool = True):
+        self.explore_rate = explore_rate
+        self.enable_personalization = enable_personalization
 
-    max_price = max((s.price for s in all_stores), default=1.0)
-    min_price = min((s.price for s in all_stores), default=1.0)
-    max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
-    total_stores = len(all_stores)
+    def select_stores(self, customer: Customer, n: int, all_stores: List[Restaurant], t: int = 0) -> List[Restaurant]:
+        if not all_stores:
+            return []
 
-    order_counts = {}
-    if hasattr(customer, "history") and "orders" in customer.history:
-        for rid in customer.history['orders']:
-            order_counts[rid] = order_counts.get(rid, 0) + 1
+        available = [s for s in all_stores if s.est_inventory > s.reservation_count]
+        if not available:
+            return []
+        if len(available) <= n:
+            return available[:n]
 
-    fav_ids = set([rid for rid, _ in sorted(order_counts.items(), key = lambda x: -x[1])][:3])
+        max_price = max((s.price for s in all_stores), default=1.0)
+        max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
 
-    total_reservations = sum(s.reservation_count for s in all_stores)
-    total_capacity = sum(s.est_inventory for s in all_stores)
-    market_utilization = total_reservations / max(1.0, total_capacity)
+        # Light personalization (small boost only)
+        order_counts = {}
+        if hasattr(customer, "history") and "orders" in customer.history:
+            for rid in customer.history["orders"]:
+                order_counts[rid] = order_counts.get(rid, 0) + 1
+        fav_ids = set([rid for rid, _ in sorted(order_counts.items(), key=lambda x: -x[1])][:2])
+        preferred_cats = customer.preferences.get("preferred_categories", [])
 
-    if market_utilization > 0.8:
-        supply_weight = 0.42
-        revenue_weight = 0.22
-        value_weight = 0.13
-        fairness_weight = 0.10
-        personalization_weight = 0.08
-        risk_weight = 0.05
-    elif market_utilization < 0.3:
-        supply_weight = 0.28
-        revenue_weight = 0.32
-        value_weight = 0.18
-        fairness_weight = 0.12
-        personalization_weight = 0.07
-        risk_weight = 0.03
-    else:
-        supply_weight = 0.38
-        revenue_weight = 0.24
-        value_weight = 0.14
-        fairness_weight = 0.11
-        personalization_weight = 0.09
-        risk_weight = 0.04
-    
-    scored_stores = []
+        scored = []
+        for store in available:
+            safe_cap = max(0.0, store.est_inventory - store.reservation_count)
+            safe_ratio = safe_cap / max(1.0, max_inventory)
 
-    for store in available:
-        category_match = 1.0 if store.category in customer.preferences.get('preferred_categories', []) else 0.0
-        
-        safe_capacity = max(0, store.est_inventory - store.reservation_count)
-        capacity_utilization = store.reservation_count / max(1.0, store.est_inventory)
-        optimal_utilization = 0.725
-        utilization_score = 1.0 - abs(capacity_utilization - optimal_utilization) / optimal_utilization
-        utilization_score = max(0.0, utilization_score)
-        safe_capacity_ratio = safe_capacity / max(1.0, max_inventory)
-        expected_remaining_demand = max(0, (total_stores - max(1, t)) * (1.0 / total_stores))
-        demand_supply_match = min(1.0, safe_capacity / max(1.0, expected_remaining_demand * store.est_inventory))
-        supply_demand_score = (0.4 * safe_capacity_ratio + 0.35 * utilization_score + 0.25 * demand_supply_match)
-        
-        base_revenue = (store.price / max_price) * (store.rating / 5.0)
-        load_ratio = store.reservation_count / max(1.0, store.est_inventory)
-        base_cancel_prob = (1.0 - store.accuracy_score) * load_ratio
-        time_factor = min(1.0, t / max(1.0, total_stores * 0.8))
-        time_risk = time_factor * (1.0 - safe_capacity_ratio) * 0.3
-        cancellation_prob = min(1.0, base_cancel_prob + time_risk)
-        fill_probability = 1.0 - cancellation_prob
-        revenue_score = base_revenue * fill_probability
-        
-        price_normalized = (store.price - min_price) / max(1.0, max_price - min_price)
-        value_score = (store.rating / 5.0) * (1.0 - price_normalized * 0.4)
-        
-        if t > 0:
-            expected_exposure = t / total_stores
-            store_exposure = getattr(store, 'exposure_count', 0)
-            exposure_deficit = max(0, expected_exposure - store_exposure)
-            fairness_score = min(1.0, exposure_deficit / max(1.0, expected_exposure))
-        else:
-            fairness_score = 1.0 / total_stores
-        
-        personalization_score = (1.0 if store.restaurant_id in fav_ids else 0.0) * 0.7 + category_match * 0.3
-        
-        risk_score = cancellation_prob * (store.price / max_price) * (1.0 + time_risk)
-        risk_penalty = -risk_score
-        
-        customer_preference_boost = category_match * 0.18
-        
-        combined_score = (
-            supply_weight * supply_demand_score +
-            revenue_weight * revenue_score +
-            value_weight * value_score +
-            fairness_weight * fairness_score +
-            (personalization_weight * 1.5) * personalization_score +
-            risk_weight * risk_penalty +
-            (customer_preference_boost * 1.2)
-        )
-        
-        scored_stores.append((combined_score, store.restaurant_id, store))
-    
-    scored_stores.sort(key=lambda x: (x[0], -x[1]), reverse=True)
-    selected = [store for _, _, store in scored_stores[:n]]
-    
-    if len(selected) > 0 and np.random.uniform() < (self.exploration_rate * 0.5):
-        unexplored = [s for s in available if s not in selected and getattr(s, 'exposure_count', 0) < t / total_stores]
-        if unexplored:
-            exploration_scores = []
-            for s in unexplored:
-                alpha = max(1, getattr(s, 'exposure_count', 0) + 1)
-                beta = max(1, (t / total_stores) - getattr(s, 'exposure_count', 0) + 1)
-                thompson_sample = np.random.beta(alpha, beta)
-                exploration_scores.append((thompson_sample, s))
-            
-            exploration_scores.sort(key=lambda x: x[0], reverse=True)
-            if exploration_scores and exploration_scores[0][0] > 0.6:
-                selected[-1] = exploration_scores[0][1]
-    
-    return selected
+            util = store.reservation_count / max(1.0, store.est_inventory)
+            util_score = max(0.0, 1.0 - abs(util - 0.70) / 0.70)
+            reliability = store.accuracy_score
+            value_metric = (store.rating / 5.0) / max(0.1, store.price / max_price)
+
+            exposure = getattr(store, "exposure_count", 0)
+            novelty = (1.0 / (1.0 + exposure)) * min(1.0, max(0.6, reliability))
+
+            waste_penalty = max(0.0, safe_ratio - util_score) * (store.price / max_price)
+            overload_risk = max(0.0, util - 0.85) * 0.2
+            risk_penalty = (1.0 - reliability) * util + overload_risk
+
+            # Hard gates
+            if reliability < 0.50:
+                continue
+            if reliability < 0.70 and util > 0.70:
+                continue
+            if util > 0.95:
+                continue
+
+            personal_boost = 0.0
+            if self.enable_personalization:
+                is_fav = store.restaurant_id in fav_ids
+                cat_match = 1.0 if store.category in preferred_cats else 0.0
+                if is_fav or cat_match:
+                    personal_boost = 0.04  # capped small boost
+
+            base_score = (
+                0.30 * safe_ratio +
+                0.18 * util_score +
+                0.16 * reliability +
+                0.12 * value_metric +
+                0.08 * novelty +
+                (-0.10) * waste_penalty +
+                (-0.12) * risk_penalty +
+                personal_boost
+            )
+
+            scored.append({
+                "store": store,
+                "score": base_score,
+                "value": value_metric,
+                "novelty": novelty,
+                "risk": risk_penalty,
+                "util": util,
+                "reliability": reliability,
+            })
+
+        if not scored:
+            return []
+
+        # Tier sizes
+        core_slots = max(1, int(round(n * 0.4)))
+        value_slots = max(1, int(round(n * 0.3)))
+        explore_slots = max(1, n - core_slots - value_slots)
+
+        def sort_by_score(items):
+            return sorted(items, key=lambda x: (x["score"], x["store"].rating, -x["store"].price), reverse=True)
+
+        def sort_by_value(items):
+            return sorted(items, key=lambda x: (x["value"], x["score"]), reverse=True)
+
+        def sort_by_novelty(items):
+            return sorted(items, key=lambda x: (x["novelty"], x["score"]), reverse=True)
+
+        selected = []
+        used_ids = set()
+
+        # Core: reliable & not overloaded
+        core_candidates = [x for x in scored if x["reliability"] >= 0.78 and x["util"] < 0.82]
+        for entry in sort_by_score(core_candidates):
+            if len(selected) >= core_slots:
+                break
+            sid = entry["store"].restaurant_id
+            if sid not in used_ids:
+                selected.append(entry)
+                used_ids.add(sid)
+
+        # Value picks
+        value_candidates = [x for x in scored if x["store"].restaurant_id not in used_ids and x["risk"] < 0.22]
+        for entry in sort_by_value(value_candidates):
+            if len(selected) >= core_slots + value_slots:
+                break
+            sid = entry["store"].restaurant_id
+            if sid not in used_ids:
+                selected.append(entry)
+                used_ids.add(sid)
+
+        # Explorers (novelty with minimum reliability)
+        explore_candidates = [x for x in scored if x["store"].restaurant_id not in used_ids and x["reliability"] >= 0.65]
+        for entry in sort_by_novelty(explore_candidates):
+            if len(selected) >= core_slots + value_slots + explore_slots:
+                break
+            sid = entry["store"].restaurant_id
+            if sid not in used_ids:
+                selected.append(entry)
+                used_ids.add(sid)
+
+        # Backfill if short
+        if len(selected) < n:
+            remaining = [x for x in sort_by_score(scored) if x["store"].restaurant_id not in used_ids]
+            for entry in remaining:
+                if len(selected) >= n:
+                    break
+                selected.append(entry)
+                used_ids.add(entry["store"].restaurant_id)
+
+        # Safety swap: replace high-risk with safer near-score alternative
+        if selected:
+            risky_idx, risky_entry = max(enumerate(selected), key=lambda x: x[1]["risk"])
+            if risky_entry["risk"] > 0.30:
+                alternatives = [
+                    x for x in sort_by_score(scored)
+                    if x["store"].restaurant_id not in used_ids and x["risk"] < 0.18 and x["util"] < 0.78
+                    and x["score"] >= risky_entry["score"] - 0.12
+                ]
+                if alternatives:
+                    best_alt = alternatives[0]
+                    used_ids.add(best_alt["store"].restaurant_id)
+                    selected[risky_idx] = best_alt
+
+        # Exploration: occasional novelty swap (only if reliable enough)
+        if selected and np.random.uniform() < self.explore_rate:
+            candidates = [
+                x for x in sort_by_novelty(scored)
+                if x["store"].restaurant_id not in used_ids and x["reliability"] >= 0.70
+            ]
+            if candidates:
+                selected[-1] = candidates[0]
+
+        return [entry["store"] for entry in selected[:n]]
 
 
