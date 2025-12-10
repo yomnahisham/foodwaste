@@ -1,0 +1,16 @@
+store_id,store_name,branch,average_bags_at_9AM,average_overall_rating,price,longitude,latitude
+1,Store_1,Pizza,2,2.83985,30.36786,0.0,0.0
+2,Store_2,Pizza,4,4.56394,12.26817,0.0,0.0
+3,Store_3,Bakery,3,3.76978,20.31642,0.0,0.0
+4,Store_4,Bakery,4,4.3321,42.4467,0.0,0.0
+5,Store_5,Sushi,2,2.94749,46.7922,0.0,0.0
+6,Store_6,Sushi,3,2.80193,39.39485,0.0,0.0
+7,Store_7,Restaurant,2,3.37603,22.94801,0.0,0.0
+8,Store_8,Sushi,4,4.04862,16.49854,0.0,0.0
+9,Store_9,Sushi,3,3.3847,19.48081,0.0,0.0
+10,Store_10,Cafe,4,3.29089,49.82613,0.0,0.0
+11,Store_11,Fast Food,3,3.33212,23.1151,0.0,0.0
+12,Store_12,Fast Food,4,4.02731,7.60057,0.0,0.0
+13,Store_13,Grocery,4,3.05815,25.33795,0.0,0.0
+14,Store_14,Bakery,2,3.34344,22.89893,0.0,0.0
+15,Store_15,Deli,3,4.88589,14.95828,0.0,0.0
