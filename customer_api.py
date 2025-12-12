@@ -61,6 +61,48 @@ class Customer:
         self.decision = None  # 'buy' or 'leave'
         self.chosen_store_id = None
         self.displayed_stores = []
+        
+        # churn tracking
+        self.consecutive_cancellations = 0
+        self.is_churned = False
+        self.days_since_churn = 0
+    
+    def determine_segment(self) -> str:
+        """
+        derive customer segment from existing characteristics.
+        segments emerge naturally from customer traits - no random assignment needed.
+        """
+        max_price = self.preferences.get('max_price', 25.0)
+        min_rating = self.preferences.get('min_rating', 3.0)
+        has_orders = len(self.history.get('orders', [])) > 0
+        
+        # price sensitive: low price tolerance
+        if max_price < 20.0:
+            return 'PRICE_SENSITIVE'
+        
+        # quality focused: high rating requirements, not price sensitive
+        if min_rating > 3.5 and max_price > 25.0:
+            return 'QUALITY_FOCUSED'
+        
+        # loyal: high bias score and has order history
+        if self.bias_score > 0.7 and has_orders:
+            return 'LOYAL'
+        
+        # explorer: high neophilia, low bias
+        if self.neophila_score > 0.7 and self.bias_score < 0.4:
+            return 'EXPLORER'
+        
+        # convenience seeker: moderate bias, moderate neophilia (balanced but prefers familiar)
+        if 0.4 <= self.bias_score <= 0.7 and 0.3 <= self.neophila_score <= 0.6:
+            return 'CONVENIENCE_SEEKER'
+        
+        # balanced: default for everyone else
+        return 'BALANCED'
+    
+    @property
+    def customer_segment(self) -> str:
+        """get customer segment (computed property)"""
+        return self.determine_segment()
 
     def update_preferences(self, **kwargs):
         """Update customer preferences"""
@@ -210,6 +252,18 @@ def probability_of_purchase(store: Restaurant, customer: Customer) -> float:
     return max(0.0, min(1.0, final_prob))
 
 
+# segment-specific utility multipliers
+# applied to base utility components based on customer segment
+SEGMENT_MULTIPLIERS = {
+    'PRICE_SENSITIVE': {'price': 2.0, 'rating': 0.5, 'familiarity': 0.5, 'neophilia': 0.5},
+    'QUALITY_FOCUSED': {'price': 0.5, 'rating': 2.0, 'familiarity': 0.5, 'neophilia': 0.5},
+    'LOYAL': {'price': 1.0, 'rating': 1.0, 'familiarity': 3.0, 'neophilia': 0.2},
+    'EXPLORER': {'price': 1.0, 'rating': 1.0, 'familiarity': 0.3, 'neophilia': 2.0},
+    'CONVENIENCE_SEEKER': {'price': 1.0, 'rating': 1.0, 'familiarity': 1.5, 'neophilia': 0.3},
+    'BALANCED': {'price': 1.0, 'rating': 1.0, 'familiarity': 1.0, 'neophilia': 1.0}
+}
+
+
 class CustomerChoiceMNL:
     """
     Proper Multinomial Logit Model (MNL) for customer choice.
@@ -231,28 +285,37 @@ class CustomerChoiceMNL:
         """
         Calculate utility using additive model (proper MNL).
         Utility = sum of attribute values × coefficients
+        Segment-specific multipliers adjust weights based on customer type.
         """
         utility = self.params['base_utility']
         
-        # Price (continuous, negative coefficient)
-        utility += self.params['price_sensitivity'] * (store.price / 10.0)
+        # get customer segment and multipliers
+        segment = customer.customer_segment
+        multipliers = SEGMENT_MULTIPLIERS.get(segment, SEGMENT_MULTIPLIERS['BALANCED'])
         
-        # Rating (continuous, positive coefficient)
-        utility += self.params['rating_importance'] * (store.rating / 5.0)
+        # price (continuous, negative coefficient) - adjusted by segment
+        price_component = self.params['price_sensitivity'] * (store.price / 10.0)
+        utility += price_component * multipliers['price']
         
-        # Category match (realistic behavior - users prefer same category)
+        # rating (continuous, positive coefficient) - adjusted by segment
+        rating_component = self.params['rating_importance'] * (store.rating / 5.0)
+        utility += rating_component * multipliers['rating']
+        
+        # category match (realistic behavior - users prefer same category)
         if store.category in customer.preferences.get('preferred_categories', []):
             utility += self.params['category_match']
         
-        # Familiarity bias (realistic behavior - loyal customers)
+        # familiarity bias (realistic behavior - loyal customers) - adjusted by segment
         if store.restaurant_id in customer.history.get("orders", []):
-            utility += self.params['familiarity_boost'] * customer.bias_score
+            familiarity_component = self.params['familiarity_boost'] * customer.bias_score
+            utility += familiarity_component * multipliers['familiarity']
         
-        # Neophilia (realistic behavior - adventurous users)
+        # neophilia (realistic behavior - adventurous users) - adjusted by segment
         if store.restaurant_id not in customer.history.get("viewedRestaurants", []):
-            utility += self.params['neophilia_boost'] * customer.neophila_score
+            neophilia_component = self.params['neophilia_boost'] * customer.neophila_score
+            utility += neophilia_component * multipliers['neophilia']
         
-        # Inventory availability (prefer stores with stock)
+        # inventory availability (prefer stores with stock)
         if store.est_inventory > store.reservation_count:
             safe_capacity = store.est_inventory - store.reservation_count
             utility += 0.2 * min(1.0, safe_capacity / 10.0)

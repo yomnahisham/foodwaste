@@ -39,6 +39,41 @@ class Restaurant:
         """Update daily supply and price"""
         self.price = new_price
         self.est_inventory = new_inventory
+    
+    def update_midday_inventory_estimate(self, expected_sales_rate: float, time_elapsed: float, total_duration: float = 24.0):
+        """
+        update inventory estimate during the day based on sales velocity.
+        if selling faster than expected, reduce estimate (might run out).
+        uses exponential smoothing to adjust estimates smoothly.
+        
+        args:
+            expected_sales_rate: expected sales per hour (total_expected / duration)
+            time_elapsed: hours elapsed in the day
+            total_duration: total hours in day (default 24)
+        """
+        if time_elapsed <= 0 or self.est_inventory <= 0:
+            return
+        
+        # calculate expected sales so far
+        expected_sales_so_far = expected_sales_rate * time_elapsed
+        
+        # actual reservations (sales) so far
+        actual_sales_so_far = self.reservation_count
+        
+        # sales velocity ratio: > 1.0 means selling faster than expected
+        if expected_sales_so_far > 0:
+            velocity_ratio = actual_sales_so_far / expected_sales_so_far
+        else:
+            velocity_ratio = 1.0
+        
+        # if selling much faster than expected (velocity > 1.3), reduce estimate
+        # if selling slower, keep estimate (might catch up later)
+        if velocity_ratio > 1.3:
+            # selling faster - might run out, reduce estimate
+            # use exponential smoothing: new_est = 0.7 * old_est + 0.3 * adjusted
+            adjustment_factor = 1.0 / velocity_ratio  # reduce by inverse of velocity
+            new_estimate = 0.7 * self.est_inventory + 0.3 * (self.est_inventory * adjustment_factor)
+            self.est_inventory = max(1, int(new_estimate))
 
     def receive_rating(self, rating):
         """Update rating with new customer rating"""
@@ -90,6 +125,55 @@ class Restaurant:
         accuracy = 1 - (0.7 * window_errors_mean + 0.3 * errors_mean)
         self.accuracy_score = accuracy
         return accuracy
+
+    def update_inventory_estimate(self, learning_window_days: int = 10):
+        """
+        adaptively update inventory estimate based on recent accuracy performance.
+        stores learn from their mistakes and adjust estimates over time.
+        
+        if consistently overestimating (actual < est): reduce estimates
+        if consistently underestimating (actual > est): increase estimates
+        learning rate based on accuracy_score (better stores learn faster)
+        """
+        if len(self.inventory_history) < 3:
+            # not enough history to learn from
+            return
+        
+        # look at recent history (last learning_window_days days)
+        recent_history = self.inventory_history[-learning_window_days:]
+        if len(recent_history) < 3:
+            recent_history = self.inventory_history[-3:]
+        
+        # calculate average error direction
+        overestimates = 0
+        underestimates = 0
+        total_days = len(recent_history)
+        
+        for date, est, actual in recent_history:
+            if est > 0:
+                if actual < est:
+                    overestimates += 1
+                elif actual > est:
+                    underestimates += 1
+        
+        # determine if we need to adjust
+        overestimate_ratio = overestimates / total_days if total_days > 0 else 0
+        underestimate_ratio = underestimates / total_days if total_days > 0 else 0
+        
+        # learning rate: better stores (higher accuracy) learn faster
+        # accuracy_score ranges 0-1, so learning rate ranges 0.1-0.3
+        base_learning_rate = 0.15
+        learning_rate = base_learning_rate + (self.accuracy_score * 0.15)  # 0.15 to 0.30
+        
+        # adjust estimate based on pattern
+        if overestimate_ratio > 0.6:
+            # consistently overestimating - reduce estimate
+            adjustment = -learning_rate * self.est_inventory
+            self.est_inventory = max(1, int(self.est_inventory + adjustment))
+        elif underestimate_ratio > 0.6:
+            # consistently underestimating - increase estimate
+            adjustment = learning_rate * self.est_inventory
+            self.est_inventory = max(1, int(self.est_inventory + adjustment))
 
     def reset_daily_counters(self):
         """Reset daily counters for a new day"""
@@ -392,6 +476,9 @@ def end_of_day_processing_enhanced(marketplace: Optional["Marketplace"] = None, 
         # recalculate accuracy
         store.calculate_accuracy()
         store.add_daily_summary(store.reservation_count, actual_sales)
+        
+        # store learning: adapt inventory estimates based on recent performance
+        store.update_inventory_estimate(learning_window_days=10)
     
     # calculate customer satisfaction (improved formula)
     total_customers = marketplace.total_customers_seen if marketplace else 0

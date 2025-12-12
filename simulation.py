@@ -65,6 +65,86 @@ def calculate_n(num_stores: int, expected_customers: int, total_estimated_invent
     return max(min_n, min(max_n, n))
 
 
+def is_peak_hour(hour: float) -> bool:
+    """check if given hour falls within peak demand periods"""
+    # lunch peak: 11am-2pm (11-14)
+    # dinner peak: 5pm-9pm (17-21)
+    return (11.0 <= hour < 14.0) or (17.0 <= hour < 21.0)
+
+
+def generate_time_weighted_arrival_times(num_customers: int, duration: float = 24.0, 
+                                        rng: np.random.RandomState = None, is_weekend: bool = False) -> List[float]:
+    """
+    generate arrival times with realistic time-of-day demand patterns.
+    creates peaks at lunch (11am-2pm) and dinner (5pm-9pm).
+    adjusts for weekday vs weekend patterns.
+    
+    weekday time multipliers:
+    - morning (6am-11am): 0.3x
+    - lunch peak (11am-2pm): 1.5x
+    - afternoon (2pm-5pm): 0.7x
+    - dinner peak (5pm-9pm): 1.8x
+    - late night (9pm-6am): 0.2x
+    
+    weekend adjustments:
+    - overall demand: 1.3x multiplier
+    - dinner peak later: 6pm-9pm instead of 5pm-9pm
+    - lunch less pronounced: 1.2x instead of 1.5x
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+    
+    # define time periods and their multipliers (weekday base)
+    if is_weekend:
+        # weekend patterns: later dinner, less lunch focus, higher overall demand
+        time_periods = [
+            (0.0, 6.0, 0.2 * 1.3),    # late night: 0.2x * 1.3
+            (6.0, 11.0, 0.3 * 1.3),   # morning: 0.3x * 1.3
+            (11.0, 14.0, 1.2 * 1.3),  # lunch peak: 1.2x * 1.3 (less pronounced)
+            (14.0, 18.0, 0.7 * 1.3),  # afternoon: 0.7x * 1.3 (extended)
+            (18.0, 21.0, 1.8 * 1.3),  # dinner peak: 1.8x * 1.3 (later: 6-9pm)
+            (21.0, 24.0, 0.2 * 1.3),  # late night: 0.2x * 1.3
+        ]
+    else:
+        # weekday patterns
+        time_periods = [
+            (0.0, 6.0, 0.2),    # late night: 0.2x
+            (6.0, 11.0, 0.3),   # morning: 0.3x
+            (11.0, 14.0, 1.5),  # lunch peak: 1.5x
+            (14.0, 17.0, 0.7),  # afternoon: 0.7x
+            (17.0, 21.0, 1.8),  # dinner peak: 1.8x
+            (21.0, 24.0, 0.2),  # late night: 0.2x
+        ]
+    
+    # calculate total weight for normalization
+    total_weight = sum((end - start) * mult for start, end, mult in time_periods)
+    
+    # generate arrival times using weighted distribution
+    arrival_times = []
+    for _ in range(num_customers):
+        # sample a time period weighted by duration * multiplier
+        rand = rng.uniform(0, total_weight)
+        cumulative = 0.0
+        selected_period = None
+        
+        for start, end, mult in time_periods:
+            period_weight = (end - start) * mult
+            cumulative += period_weight
+            if rand <= cumulative:
+                selected_period = (start, end)
+                break
+        
+        if selected_period:
+            start, end = selected_period
+            arrival_time = rng.uniform(start, end)
+            arrival_times.append(arrival_time)
+        else:
+            # fallback (shouldn't happen)
+            arrival_times.append(rng.uniform(0, duration))
+    
+    return sorted(arrival_times)
+
+
 def initialize_marketplace(num_stores: int = 10, actual_inventories: Optional[Dict[int, int]] = None,
                            expected_customers: int = 100, seed: int = 42,
                            stores_csv: Optional[str] = None) -> Marketplace:
@@ -224,7 +304,11 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     for day in range(num_days):
         # use day number as offset to ensure different but deterministic arrival times per day
         day_rng = np.random.RandomState(seed + day * 10000)
-        arrival_times = sorted(day_rng.uniform(0, duration, len(customers_copy)))
+        # calculate day of week for day-specific patterns
+        day_of_week = day % 7
+        is_weekend = day_of_week >= 5  # Saturday (5) or Sunday (6)
+        # generate time-weighted arrival times with realistic peaks (adjusted for weekday/weekend)
+        arrival_times = generate_time_weighted_arrival_times(len(customers_copy), duration, day_rng, is_weekend)
         all_days_arrival_times.append(arrival_times)
     
     # reset main RNG to seed for strategy-specific randomness
@@ -252,8 +336,17 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         if verbose and (day % 5 == 0 or day == 1 or day == num_days):
             print(f"  [{strategy_name}] Day {day}/{num_days}...")
         
+        # calculate day of week (0=Monday, 6=Sunday) for day-of-week effects
+        day_of_week = (day - 1) % 7
+        is_weekend = day_of_week >= 5  # Saturday (5) or Sunday (6)
+        
         # initialize day for stores (resets counters on the copied stores)
         initialize_day(stores_copy)
+        
+        # update churn status: increment days since churn for churned customers
+        for customer in customers_copy:
+            if customer.is_churned:
+                customer.days_since_churn += 1
         
         # reset marketplace counters for the day
         marketplace.total_revenue = 0.0
@@ -266,8 +359,10 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # use pre-generated arrival times for this day
         arrival_times = all_days_arrival_times[day - 1]
         
-        # generate arrival decisions for this day based on current customer satisfaction
-        # this allows satisfaction changes from previous days to affect arrival probabilities
+        # generate arrival decisions for this day
+        # IMPORTANT: use INITIAL satisfaction levels (from day 1) for fair comparison
+        # this ensures all strategies see the same customer arrival patterns
+        # if we used updated satisfaction, different strategies would have different arrival counts making comparison unfair
         # use a deterministic RNG seed per day to ensure fair comparison across strategies
         base_arrival_probability = 0.7  # base chance customer opens app
         decision_rng = np.random.RandomState(seed + (day - 1) * 10000 + 5000)
@@ -276,10 +371,24 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # create mapping from customer to index for efficient lookup
         customer_to_idx = {id(c): i for i, c in enumerate(customers_copy)}
         
+        # store initial satisfaction levels on first day for fair comparison
+        if day == 1:
+            for customer in customers_copy:
+                customer._initial_satisfaction = customer.satisfaction_level
+                customer._initial_is_churned = customer.is_churned
+        
         for i, customer in enumerate(customers_copy):
-            # use customer's current satisfaction level (may have changed from previous days)
-            satisfaction_multiplier = 0.5 + customer.satisfaction_level
+            # use INITIAL satisfaction level (from day 1) for fair comparison
+            # this ensures all strategies see the same arrival patterns
+            initial_satisfaction = getattr(customer, '_initial_satisfaction', customer.satisfaction_level)
+            satisfaction_multiplier = 0.5 + initial_satisfaction
             arrival_probability = base_arrival_probability * satisfaction_multiplier
+            
+            # use initial churn status for fair comparison
+            initial_is_churned = getattr(customer, '_initial_is_churned', customer.is_churned)
+            if initial_is_churned:
+                arrival_probability *= 0.1  # 10% of base probability
+            
             arrival_probability = min(1.0, max(0.0, arrival_probability))
             
             # generate the decision using deterministic RNG
@@ -299,15 +408,30 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # dictionary preserves insertion order, so order = arrival order
         customer_orders_today = {}  # {customer_id: store_id} - ordered by arrival time
         
+        # track peak vs off-peak metrics for supply-demand balance KPI
+        peak_reservations = {}  # {store_id: count} - reservations during peak hours
+        peak_completed = {}     # {store_id: count} - completed orders during peak hours
+        peak_cancellations = {} # {store_id: count} - cancellations during peak hours
+        peak_waste = {}         # {store_id: count} - waste during peak hours
+        offpeak_reservations = {}
+        offpeak_completed = {}
+        offpeak_cancellations = {}
+        offpeak_waste = {}
+        
+        # calculate expected sales rate for mid-day inventory updates
+        total_expected_sales = sum(s.est_inventory for s in stores_copy)
+        expected_sales_rate = total_expected_sales / duration if duration > 0 else 0
+        
         # process each customer arrival in order
         # customers cannot cancel their own orders - only restaurant inventory shortage causes cancellations
+        customers_processed = 0
         for customer in customers_sorted:
             # check pre-generated arrival decision (use efficient lookup)
             customer_idx = customer_to_idx.get(id(customer), -1)
             will_arrive = arrival_decision_dict.get(customer_idx, True)  # default to True if not found
             
             if not will_arrive:
-                # Customer doesn't open app today (pre-determined)
+                # customer doesn't open app today (pre-determined)
                 decision = {
                     'action': 'no_arrival',
                     'store_id': None
@@ -346,9 +470,79 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             # only track orders (not no_arrival or leave)
             if decision['action'] == 'buy':
                 customer_orders_today[customer.customer_id] = decision['store_id']
+                # track peak vs off-peak reservations for supply-demand balance KPI
+                store_id = decision['store_id']
+                is_peak = is_peak_hour(customer.arrival_time)
+                if is_peak:
+                    peak_reservations[store_id] = peak_reservations.get(store_id, 0) + 1
+                else:
+                    offpeak_reservations[store_id] = offpeak_reservations.get(store_id, 0) + 1
+            
+            customers_processed += 1
+            
+            # update mid-day inventory estimates periodically (every 10 customers)
+            # this allows stores to adjust estimates based on sales velocity
+            if customers_processed % 10 == 0:
+                time_elapsed = customer.arrival_time
+                for store in stores_copy:
+                    store.update_midday_inventory_estimate(expected_sales_rate, time_elapsed, duration)
         
         # end of day processing
         day_results = process_end_of_day(marketplace)
+        
+        # calculate peak vs off-peak metrics for supply-demand balance KPI
+        # we need to determine which orders were completed/cancelled during peak hours
+        # by checking customer arrival times for each order
+        peak_total_reservations = sum(peak_reservations.values())
+        offpeak_total_reservations = sum(offpeak_reservations.values())
+        
+        # calculate peak/off-peak completed and cancelled based on store results
+        # and customer arrival times
+        for store in stores_copy:
+            store_id = store.restaurant_id
+            peak_res = peak_reservations.get(store_id, 0)
+            offpeak_res = offpeak_reservations.get(store_id, 0)
+            total_res = peak_res + offpeak_res
+            
+            if total_res > 0:
+                # proportionally allocate completed/cancelled to peak vs off-peak
+                # ensure we don't allocate more than actual reservations
+                peak_ratio = peak_res / total_res if total_res > 0 else 0
+                # cap allocations to not exceed reservations
+                peak_completed[store_id] = min(int(store.completed_order_count * peak_ratio), peak_res)
+                peak_cancellations[store_id] = min(int(store.cancellation_count * peak_ratio), peak_res)
+                # ensure off-peak doesn't exceed off-peak reservations
+                offpeak_completed[store_id] = min(store.completed_order_count - peak_completed[store_id], offpeak_res)
+                offpeak_cancellations[store_id] = min(store.cancellation_count - peak_cancellations[store_id], offpeak_res)
+                
+                # waste is allocated based on when inventory was available
+                # for simplicity, allocate proportionally (could be improved)
+                peak_waste[store_id] = int(day_results.get('total_waste', 0) * peak_ratio / len(stores_copy))
+                offpeak_waste[store_id] = (day_results.get('total_waste', 0) / len(stores_copy)) - peak_waste[store_id]
+        
+        peak_total_completed = sum(peak_completed.values())
+        peak_total_cancellations = sum(peak_cancellations.values())
+        peak_total_waste = sum(peak_waste.values())
+        offpeak_total_completed = sum(offpeak_completed.values())
+        offpeak_total_cancellations = sum(offpeak_cancellations.values())
+        offpeak_total_waste = sum(offpeak_waste.values())
+        
+        # calculate peak supply-demand balance metrics
+        # cap fulfillment rate at 100% (can't fulfill more than reservations)
+        peak_fulfillment_rate = min((peak_total_completed / peak_total_reservations * 100) if peak_total_reservations > 0 else 0.0, 100.0)
+        peak_cancellation_rate = min((peak_total_cancellations / peak_total_reservations * 100) if peak_total_reservations > 0 else 0.0, 100.0)
+        peak_waste_rate = (peak_total_waste / sum(s.actual_inventory for s in stores_copy) * 100) if stores_copy else 0.0
+        
+        # calculate peak supply-demand ratio (how well supply matched demand)
+        # this measures how much demand (reservations) relative to available supply during peaks
+        # we approximate by using est_inventory as the supply available
+        peak_total_supply = sum(s.est_inventory for s in stores_copy)
+        peak_supply_demand_ratio = (peak_total_reservations / peak_total_supply) if peak_total_supply > 0 else 0.0
+        
+        # off-peak metrics for comparison
+        # cap fulfillment rate at 100% (can't fulfill more than reservations)
+        offpeak_fulfillment_rate = min((offpeak_total_completed / offpeak_total_reservations * 100) if offpeak_total_reservations > 0 else 0.0, 100.0)
+        offpeak_cancellation_rate = min((offpeak_total_cancellations / offpeak_total_reservations * 100) if offpeak_total_reservations > 0 else 0.0, 100.0)
         
         # update cancellation status and customer satisfaction
         # cancellations occur when restaurant's actual inventory < reservations
@@ -374,7 +568,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
                         activity['action'] == 'buy'):
                         activity['cancelled'] = True
         
-        # update individual customer satisfaction levels based on their experience today
+        # update individual customer satisfaction levels and churn status based on their experience today
         # find customers who successfully completed orders vs got cancelled
         customer_id_to_obj = {c.customer_id: c for c in customers_copy}
         
@@ -384,11 +578,26 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
                 customer = customer_id_to_obj.get(customer_id)
                 if customer:
                     if activity['cancelled']:
-                        # order was cancelled - decrease satisfaction
+                        # order was cancelled - decrease satisfaction and track churn
                         customer.satisfaction_level = max(0.0, customer.satisfaction_level - 0.15)
+                        customer.consecutive_cancellations += 1
+                        
+                        # churn logic: 2+ consecutive cancellations increases churn risk
+                        if customer.consecutive_cancellations >= 2:
+                            customer.is_churned = True
+                            customer.days_since_churn = 0
                     else:
-                        # order completed successfully - increase satisfaction slightly
+                        # order completed successfully - increase satisfaction and reset cancellation streak
                         customer.satisfaction_level = min(1.0, customer.satisfaction_level + 0.05)
+                        customer.consecutive_cancellations = 0
+                        
+                        # win-back: if customer was churned but completed order, reduce churn
+                        if customer.is_churned:
+                            customer.days_since_churn += 1
+                            if customer.days_since_churn >= 7:
+                                # win-back after 7 days of good behavior
+                                customer.is_churned = False
+                                customer.days_since_churn = 0
         
         # store daily KPIs (including enhanced metrics)
         daily_kpis = {
@@ -404,7 +613,16 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             # enhanced metrics
             'profit_margin': day_results.get('profit_margin_proxy', 0.0),
             'revenue_per_customer': day_results.get('revenue_per_customer', 0.0),
-            'avg_store_accuracy': day_results.get('avg_store_accuracy', 0.0)
+            'avg_store_accuracy': day_results.get('avg_store_accuracy', 0.0),
+            # peak supply-demand balance metrics
+            'peak_fulfillment_rate': peak_fulfillment_rate,
+            'peak_cancellation_rate': peak_cancellation_rate,
+            'peak_waste_rate': peak_waste_rate,
+            'peak_supply_demand_ratio': peak_supply_demand_ratio,
+            'offpeak_fulfillment_rate': offpeak_fulfillment_rate,
+            'offpeak_cancellation_rate': offpeak_cancellation_rate,
+            'peak_reservations': peak_total_reservations,
+            'offpeak_reservations': offpeak_total_reservations
         }
         daily_kpis_list.append(daily_kpis)
     
@@ -426,6 +644,13 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'profit_margin': np.mean([k.get('profit_margin', 0.0) for k in daily_kpis_list]),
         'revenue_per_customer': np.mean([k.get('revenue_per_customer', 0.0) for k in daily_kpis_list]),
         'avg_store_accuracy': np.mean([k.get('avg_store_accuracy', 0.0) for k in daily_kpis_list]),
+        # peak supply-demand balance metrics (averages)
+        'avg_peak_fulfillment_rate': np.mean([k.get('peak_fulfillment_rate', 0.0) for k in daily_kpis_list]),
+        'avg_peak_cancellation_rate': np.mean([k.get('peak_cancellation_rate', 0.0) for k in daily_kpis_list]),
+        'avg_peak_waste_rate': np.mean([k.get('peak_waste_rate', 0.0) for k in daily_kpis_list]),
+        'avg_peak_supply_demand_ratio': np.mean([k.get('peak_supply_demand_ratio', 0.0) for k in daily_kpis_list]),
+        'avg_offpeak_fulfillment_rate': np.mean([k.get('offpeak_fulfillment_rate', 0.0) for k in daily_kpis_list]),
+        'avg_offpeak_cancellation_rate': np.mean([k.get('offpeak_cancellation_rate', 0.0) for k in daily_kpis_list]),
         'total_days': num_days
     }
     
@@ -609,7 +834,12 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             # Enhanced Metrics
             kpis.get('profit_margin', 0.0),
             kpis.get('revenue_per_customer', 0.0),
-            kpis.get('avg_store_accuracy', 0.0)
+            kpis.get('avg_store_accuracy', 0.0),
+            # Peak Supply-Demand Balance Metrics
+            kpis.get('avg_peak_fulfillment_rate', 0.0),
+            kpis.get('avg_peak_cancellation_rate', 0.0),
+            kpis.get('avg_peak_supply_demand_ratio', 0.0),
+            kpis.get('avg_offpeak_fulfillment_rate', 0.0)
         ]
     
     comparison = {
@@ -623,7 +853,11 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             'Cancellation Rate (%)',
             'Profit Margin (%)',
             'Revenue per Customer',
-            'Avg Store Accuracy'
+            'Avg Store Accuracy',
+            'Peak Fulfillment Rate (%)',
+            'Peak Cancellation Rate (%)',
+            'Peak Supply-Demand Ratio',
+            'Off-Peak Fulfillment Rate (%)'
         ],
         'greedy': calc_metrics(greedy_results),
         'near_optimal': calc_metrics(near_optimal_results),
@@ -672,11 +906,14 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             }
             
             # Identify best
-            # Lower is better: Cancellations, Waste, Cancellation Rate
+            # Lower is better: Cancellations, Waste, Cancellation Rate (including peak cancellation rate)
             if 'Cancellation' in metric or ('Waste' in metric and 'Rate' not in metric):
                 best_val = min(vals.values())
+            elif 'Supply-Demand Ratio' in metric:
+                # For supply-demand ratio, closer to 1.0 is better (balanced supply and demand)
+                best_val = min(vals.values(), key=lambda x: abs(x - 1.0))
             else:
-                # Higher is better: Revenue, Completed Orders, Fulfillment, Margin, Accuracy
+                # Higher is better: Revenue, Completed Orders, Fulfillment, Margin, Accuracy (including peak fulfillment)
                 best_val = max(vals.values())
             
             best_strategies = [k for k, v in vals.items() if abs(v - best_val) < 0.001]
@@ -687,6 +924,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
                 if 'Revenue' in metric or 'Customer' in metric and '$' in metric: return f"${v:.2f}"
                 if 'Rate' in metric or 'Margin' in metric or '%' in metric: return f"{v:.2f}%"
                 if 'Accuracy' in metric: return f"{v:.3f}"
+                if 'Ratio' in metric: return f"{v:.3f}"
                 return f"{v:.1f}"
                 
             row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Anan']):<12} {fmt(vals['Yomna']):<12} {best_str:<10}"
