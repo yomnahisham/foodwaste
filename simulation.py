@@ -102,60 +102,60 @@ def simulate_customer_arrival(marketplace: Marketplace, customer: Customer, skip
         skip_arrival_check: If True, skip the arrival probability check (used when
                           arrival decision is pre-generated for fair comparison)
     """
-    # Stage 1: Customer decides if they will open the app today
-    # Realistic behavior: Not all customers open the app every day
+    # stage 1: customer decides if they will open the app today
+    # realistic behavior: not all customers open the app every day
     if not skip_arrival_check:
-        # Base arrival probability (can be adjusted based on customer characteristics)
+        # base arrival probability (can be adjusted based on customer characteristics)
         base_arrival_probability = 0.7  # 70% base chance customer opens app on a given day
         
-        # Adjust based on customer satisfaction (satisfied customers more likely to return)
+        # adjust based on customer satisfaction (satisfied customers more likely to return)
         # satisfaction_level is typically 0.5-1.0, so multiplier ranges from 1.0 to 1.5
         satisfaction_multiplier = 0.5 + customer.satisfaction_level
         arrival_probability = base_arrival_probability * satisfaction_multiplier
         
-        # Clamp to valid probability range [0, 1]
+        # clamp to valid probability range [0, 1]
         arrival_probability = min(1.0, max(0.0, arrival_probability))
         
-        # Customer decides if they open the app
+        # customer decides if they open the app
         if np.random.uniform() > arrival_probability:
-            # Customer doesn't open app today
+            # customer doesn't open app today
             return {
-                'action': 'no_arrival',  # New action: customer didn't even arrive
+                'action': 'no_arrival',  # new action: customer didn't even arrive
                 'store_id': None
             }
     
-    # Customer opens app - proceed with decision
+    # customer opens app - proceed with decision
     customer_arrives(customer)
     marketplace.current_time = customer.arrival_time
     marketplace.total_customers_seen += 1
 
     all_stores = marketplace.stores
 
-    # Select n stores to display using ranking algorithm
+    # select n stores to display using ranking algorithm
     t = marketplace.total_customers_seen
     n = marketplace.n
     displayed_stores = ranking_algorithm.select_stores(customer, n, all_stores, t)
 
-    # Display stores to customer
+    # display stores to customer
     display_stores_to_customer(customer, displayed_stores)
 
-    # Update exposure for displayed stores
+    # update exposure for displayed stores
     for store in displayed_stores:
         store.exposure_count += 1
 
-    # Customer makes decision using proper MNL model
-    # Note: current_hour parameter is kept for API compatibility but not used (food waste collected at 10 PM)
+    # customer makes decision using proper MNL model
+    # note: current_hour parameter is kept for API compatibility but not used (food waste collected at 10 PM)
     decision = customer_makes_decision(customer, displayed_stores, customer.arrival_time)
 
-    # Update reservations if customer bought
+    # update reservations if customer bought
     if decision['action'] == 'buy':
-        # Find store in marketplace.stores and update it directly
+        # find store in marketplace.stores and update it directly
         store = next((s for s in all_stores if s.restaurant_id == decision['store_id']), None)
         if store:
             store.reserve_order()
             marketplace.total_revenue += store.price
 
-    # Add customer to marketplace
+    # add customer to marketplace
     marketplace.customers.append(customer)
 
     return decision
@@ -200,42 +200,42 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     stores_copy = copy.deepcopy(stores)
     customers_copy = copy.deepcopy(customers)
     
-    # Update strategy's internal references to point to the copies instead of originals
-    # This ensures that updates during simulation (e.g., learned_preferences) affect
+    # update strategy's internal references to point to the copies instead of originals
+    # this ensures that updates during simulation (e.g., learned_preferences) affect
     # the same objects the strategy uses for collaborative filtering
     if hasattr(strategy, 'customer_db') and strategy.customer_db is not None:
-        # Find corresponding customers in the copy by ID
+        # find corresponding customers in the copy by ID
         customer_id_to_copy = {c.customer_id: c for c in customers_copy}
         strategy.customer_db = [customer_id_to_copy.get(c.customer_id, c) 
                                for c in strategy.customer_db]
     
     if hasattr(strategy, 'restaurants_db') and strategy.restaurants_db is not None:
-        # Find corresponding stores in the copy by ID
+        # find corresponding stores in the copy by ID
         store_id_to_copy = {s.restaurant_id: s for s in stores_copy}
         strategy.restaurants_db = [store_id_to_copy.get(s.restaurant_id, s) 
                                    for s in strategy.restaurants_db]
     
-    # Generate ALL arrival times upfront for all days using separate RNGs
-    # This ensures fair comparison: all strategies see the same arrival time patterns
+    # generate all arrival times upfront for all days using separate RNGs
+    # this ensures fair comparison: all strategies see the same arrival time patterns
     # regardless of how much randomness each strategy uses during processing
     arrival_rng = np.random.RandomState(seed)
     all_days_arrival_times = []
     
     for day in range(num_days):
-        # Use day number as offset to ensure different but deterministic arrival times per day
+        # use day number as offset to ensure different but deterministic arrival times per day
         day_rng = np.random.RandomState(seed + day * 10000)
         arrival_times = sorted(day_rng.uniform(0, duration, len(customers_copy)))
         all_days_arrival_times.append(arrival_times)
     
-    # Reset main RNG to seed for strategy-specific randomness
-    # This ensures strategies can use randomness without affecting arrival times
+    # reset main RNG to seed for strategy-specific randomness
+    # this ensures strategies can use randomness without affecting arrival times
     np.random.seed(seed)
     
-    # Note: Arrival decisions are NOT pre-generated for all days upfront.
-    # Instead, they are generated at the start of each day based on CURRENT customer satisfaction levels. 
-    # This allows satisfaction changes during simulation to affect future arrival probabilities, while still maintaining determinism through the use of a deterministic RNG seed per day
+    # note: arrival decisions are NOT pre-generated for all days upfront.
+    # instead, they are generated at the start of each day based on current customer satisfaction levels. 
+    # this allows satisfaction changes during simulation to affect future arrival probabilities, while still maintaining determinism through the use of a deterministic RNG seed per day
     
-    # Monkey patch select_stores to use the strategy
+    # monkey patch select_stores to use the strategy
     original_select_stores = ranking_algorithm.select_stores
     ranking_algorithm.select_stores = strategy.select_stores
     
@@ -252,10 +252,10 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         if verbose and (day % 5 == 0 or day == 1 or day == num_days):
             print(f"  [{strategy_name}] Day {day}/{num_days}...")
         
-        # Initialize day for stores (resets counters on the COPIED stores)
+        # initialize day for stores (resets counters on the copied stores)
         initialize_day(stores_copy)
         
-        # Reset marketplace counters for the day
+        # reset marketplace counters for the day
         marketplace.total_revenue = 0.0
         marketplace.total_cancellations = 0
         marketplace.total_waste = 0
@@ -263,23 +263,26 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         marketplace.current_time = 0.0
         marketplace.customers = []
         
-        # Use pre-generated arrival times for this day
+        # use pre-generated arrival times for this day
         arrival_times = all_days_arrival_times[day - 1]
         
-        # Generate arrival decisions for this day based on CURRENT customer satisfaction
-        # This allows satisfaction changes from previous days to affect arrival probabilities
-        # Use a deterministic RNG seed per day to ensure fair comparison across strategies
-        base_arrival_probability = 0.7  # Base chance customer opens app
+        # generate arrival decisions for this day based on current customer satisfaction
+        # this allows satisfaction changes from previous days to affect arrival probabilities
+        # use a deterministic RNG seed per day to ensure fair comparison across strategies
+        base_arrival_probability = 0.7  # base chance customer opens app
         decision_rng = np.random.RandomState(seed + (day - 1) * 10000 + 5000)
         arrival_decision_dict = {}
         
+        # create mapping from customer to index for efficient lookup
+        customer_to_idx = {id(c): i for i, c in enumerate(customers_copy)}
+        
         for i, customer in enumerate(customers_copy):
-            # Use customer's CURRENT satisfaction level (may have changed from previous days)
+            # use customer's current satisfaction level (may have changed from previous days)
             satisfaction_multiplier = 0.5 + customer.satisfaction_level
             arrival_probability = base_arrival_probability * satisfaction_multiplier
             arrival_probability = min(1.0, max(0.0, arrival_probability))
             
-            # Generate the decision using deterministic RNG
+            # generate the decision using deterministic RNG
             will_arrive = decision_rng.uniform() <= arrival_probability
             arrival_decision_dict[i] = will_arrive
         
@@ -289,19 +292,19 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             customer.chosen_store_id = None
             customer.displayed_stores = []
         
-        # Sort customers by arrival time to process in order
+        # sort customers by arrival time to process in order
         customers_sorted = sorted(customers_copy, key=lambda c: c.arrival_time)
         
-        # Track customer orders for cancellation tracking
-        # Dictionary preserves insertion order (Python 3.7+), so order = arrival order
+        # track customer orders for cancellation tracking
+        # dictionary preserves insertion order, so order = arrival order
         customer_orders_today = {}  # {customer_id: store_id} - ordered by arrival time
         
-        # Process each customer arrival in order
-        # Customers cannot cancel their own orders - only restaurant inventory shortage causes cancellations
+        # process each customer arrival in order
+        # customers cannot cancel their own orders - only restaurant inventory shortage causes cancellations
         for customer in customers_sorted:
-            # Check pre-generated arrival decision
-            customer_idx = customers_copy.index(customer)
-            will_arrive = arrival_decision_dict.get(customer_idx, True)  # Default to True if not found
+            # check pre-generated arrival decision (use efficient lookup)
+            customer_idx = customer_to_idx.get(id(customer), -1)
+            will_arrive = arrival_decision_dict.get(customer_idx, True)  # default to True if not found
             
             if not will_arrive:
                 # Customer doesn't open app today (pre-determined)
@@ -313,8 +316,16 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
                 # Customer opens app - proceed with decision
                 decision = simulate_customer_arrival(marketplace, customer, skip_arrival_check=True)
             
+            # update customer history based on their action
+            if decision['action'] == 'buy' and decision.get('store_id'):
+                customer.add_to_history(decision['store_id'], 'order')
+            elif decision['action'] != 'no_arrival' and customer.displayed_stores:
+                # customer viewed stores but didn't buy - add viewed stores to history
+                for store_id in customer.displayed_stores:
+                    customer.add_to_history(store_id, 'view')
+            
             # --- STRATEGY LEARNING HOOK ---
-            # Update strategy if it has learning capabilities (e.g. Anan_Strategy)
+            # update strategy if it has learning capabilities (e.g. Anan_Strategy)
             if hasattr(strategy, 'update_learned_preferences'):
                 store = None
                 if decision['store_id'] is not None:
@@ -322,7 +333,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
                 strategy.update_learned_preferences(customer, decision, store)
             # -----------------------------
             
-            # Track activity (including no_arrival)
+            # track activity (including no_arrival)
             activity = {
                 'day': day,
                 'customer_id': customer.customer_id,
@@ -332,26 +343,29 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             }
             customer_daily_activities.append(activity)
             
-            # Only track orders (not no_arrival or leave)
+            # only track orders (not no_arrival or leave)
             if decision['action'] == 'buy':
                 customer_orders_today[customer.customer_id] = decision['store_id']
         
-        # End of day processing
+        # end of day processing
         day_results = process_end_of_day(marketplace)
         
-        # Update cancellation status
-        # Cancellations occur when restaurant's actual inventory < reservations
-        # The LAST customers to order from that restaurant get their orders cancelled (LIFO)
-        # Customers cannot cancel their own orders - only inventory shortage causes cancellations
+        # update cancellation status and customer satisfaction
+        # cancellations occur when restaurant's actual inventory < reservations
+        # the last customers to order from that restaurant get their orders cancelled (LIFO)
+        # customers cannot cancel their own orders - only inventory shortage causes cancellations
+        cancelled_customers = set()  # track which customers got cancelled
+        
         for store in stores_copy:
             if store.cancellation_count > 0:
-                # Get all customers who ordered from this store today, ordered by arrival time
+                # get all customers who ordered from this store today, ordered by arrival time
                 store_customer_ids = [cid for cid, sid in customer_orders_today.items() 
                                      if sid == store.restaurant_id]
-                # Sort by arrival time (last to arrive = last in list if customer_orders_today preserves order)
-                # Since we process customers in arrival order, the last customers in the list are the last to order
-                # These are the ones who get cancelled when actual_inventory < reservation_count
+                # sort by arrival time (last to arrive = last in list if customer_orders_today preserves order)
+                # since we process customers in arrival order, the last customers in the list are the last to order
+                # these are the ones who get cancelled when actual_inventory < reservation_count
                 cancelled_customer_ids = store_customer_ids[-store.cancellation_count:]
+                cancelled_customers.update(cancelled_customer_ids)
                 
                 for activity in customer_daily_activities:
                     if (activity['day'] == day and 
@@ -360,7 +374,23 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
                         activity['action'] == 'buy'):
                         activity['cancelled'] = True
         
-        # Store daily KPIs (including enhanced metrics)
+        # update individual customer satisfaction levels based on their experience today
+        # find customers who successfully completed orders vs got cancelled
+        customer_id_to_obj = {c.customer_id: c for c in customers_copy}
+        
+        for activity in customer_daily_activities:
+            if activity['day'] == day and activity['action'] == 'buy':
+                customer_id = activity['customer_id']
+                customer = customer_id_to_obj.get(customer_id)
+                if customer:
+                    if activity['cancelled']:
+                        # order was cancelled - decrease satisfaction
+                        customer.satisfaction_level = max(0.0, customer.satisfaction_level - 0.15)
+                    else:
+                        # order completed successfully - increase satisfaction slightly
+                        customer.satisfaction_level = min(1.0, customer.satisfaction_level + 0.05)
+        
+        # store daily KPIs (including enhanced metrics)
         daily_kpis = {
             'day': day,
             'total_customers': day_results['total_customers'],
@@ -371,7 +401,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             'total_waste_monetary': day_results.get('total_waste_monetary', 0.0),
             'customer_satisfaction': day_results.get('customer_satisfaction', 0.0),
             'conversion_rate': day_results.get('conversion_rate', 0.0),
-            # Enhanced metrics
+            # enhanced metrics
             'profit_margin': day_results.get('profit_margin_proxy', 0.0),
             'revenue_per_customer': day_results.get('revenue_per_customer', 0.0),
             'avg_store_accuracy': day_results.get('avg_store_accuracy', 0.0)
@@ -392,7 +422,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'avg_total_waste_monetary': np.mean([k['total_waste_monetary'] for k in daily_kpis_list]),
         'avg_customer_satisfaction': np.mean([k['customer_satisfaction'] for k in daily_kpis_list]),
         'avg_conversion_rate': np.mean([k.get('conversion_rate', 0.0) for k in daily_kpis_list]),
-        # Enhanced Metrics Averages
+        # enhanced metrics averages
         'profit_margin': np.mean([k.get('profit_margin', 0.0) for k in daily_kpis_list]),
         'revenue_per_customer': np.mean([k.get('revenue_per_customer', 0.0) for k in daily_kpis_list]),
         'avg_store_accuracy': np.mean([k.get('avg_store_accuracy', 0.0) for k in daily_kpis_list]),
@@ -760,7 +790,7 @@ def run_50_day_simulation(num_stores: int = 10, num_customers: int = 100, n: Opt
         customers_sorted = sorted(customers, key=lambda c: c.arrival_time)
         
         # Track customer orders for cancellation tracking
-        # Dictionary preserves insertion order (Python 3.7+), so order = arrival order
+        # Dictionary preserves insertion order, so order = arrival order
         customer_orders_today = {}  # {customer_id: store_id} - ordered by arrival time
         
         # Process each customer arrival in order
