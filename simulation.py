@@ -101,12 +101,15 @@ def simulate_customer_arrival(marketplace: Marketplace, customer: Customer) -> D
     # Stage 1: Customer decides if they will open the app today
     # Realistic behavior: Not all customers open the app every day
     # Base arrival probability (can be adjusted based on customer characteristics)
-    arrival_probability = 0.7  # 70% chance customer opens app on a given day
+    base_arrival_probability = 0.7  # 70% base chance customer opens app on a given day
     
     # Adjust based on customer satisfaction (satisfied customers more likely to return)
-    arrival_probability *= (0.5 + customer.satisfaction_level)
+    # satisfaction_level is typically 0.5-1.0, so multiplier ranges from 1.0 to 1.5
+    satisfaction_multiplier = 0.5 + customer.satisfaction_level
+    arrival_probability = base_arrival_probability * satisfaction_multiplier
     
-    arrival_probability = min(1.0, arrival_probability)
+    # Clamp to valid probability range [0, 1]
+    arrival_probability = min(1.0, max(0.0, arrival_probability))
     
     # Customer decides if they open the app
     if np.random.uniform() > arrival_probability:
@@ -189,6 +192,21 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     stores_copy = copy.deepcopy(stores)
     customers_copy = copy.deepcopy(customers)
     
+    # Generate ALL arrival times upfront for all 10 days using a separate RNG
+    # This ensures fair comparison: all strategies see the same arrival patterns
+    # regardless of how much randomness each strategy uses during processing
+    arrival_rng = np.random.RandomState(seed)
+    all_days_arrival_times = []
+    for day in range(10):
+        # Use day number as offset to ensure different but deterministic arrival times per day
+        day_rng = np.random.RandomState(seed + day * 10000)
+        arrival_times = sorted(day_rng.uniform(0, duration, len(customers_copy)))
+        all_days_arrival_times.append(arrival_times)
+    
+    # Reset main RNG to seed for strategy-specific randomness
+    # This ensures strategies can use randomness without affecting arrival times
+    np.random.seed(seed)
+    
     # Monkey patch select_stores to use the strategy
     original_select_stores = ranking_algorithm.select_stores
     ranking_algorithm.select_stores = strategy.select_stores
@@ -217,8 +235,8 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         marketplace.current_time = 0.0
         marketplace.customers = []
         
-        # Generate arrival times for this day
-        arrival_times = sorted(np.random.uniform(0, duration, len(customers_copy)))
+        # Use pre-generated arrival times for this day
+        arrival_times = all_days_arrival_times[day - 1]
         for i, customer in enumerate(customers_copy):
             customer.arrival_time = arrival_times[i]
             customer.decision = None
@@ -381,7 +399,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 1. Greedy Strategy (Baseline)
     greedy_strategy = GreedyStrategy()
     greedy_results = run_single_strategy_simulation(
-        greedy_strategy, "Greedy", stores, customers, n_value, duration, seed + 1, output_dir, verbose
+        greedy_strategy, "Greedy", stores, customers, n_value, duration, seed, output_dir, verbose
     )
     
     if verbose:
@@ -390,7 +408,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 2. Near-Optimal Strategy
     near_optimal_strategy = NearOptimalStrategy(exploration_rate=0.03)
     near_optimal_results = run_single_strategy_simulation(
-        near_optimal_strategy, "NearOptimal", stores, customers, n_value, duration, seed + 2, output_dir, verbose
+        near_optimal_strategy, "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose
     )
 
     if verbose:
@@ -399,7 +417,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 3. RWES_T Strategy
     rwes_t_strategy = RWES_T_Strategy_Wrapper()
     rwes_t_results = run_single_strategy_simulation(
-        rwes_t_strategy, "RWES_T", stores, customers, n_value, duration, seed + 3, output_dir, verbose
+        rwes_t_strategy, "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose
     )
 
     if verbose:
@@ -408,7 +426,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 4. Anan Strategy
     anan_strategy = Anan_Strategy(customers, stores)
     anan_results = run_single_strategy_simulation(
-        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed + 4, output_dir, verbose
+        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose
     )
 
     if verbose:
@@ -417,7 +435,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 5. Yomna Strategy
     yomna_strategy = Yomna_Strategy()
     yomna_results = run_single_strategy_simulation(
-        yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed + 5, output_dir, verbose
+        yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose
     )
     
     # Calculate metrics for comparison
