@@ -91,33 +91,38 @@ def initialize_marketplace(num_stores: int = 10, actual_inventories: Optional[Di
     return marketplace
 
 
-def simulate_customer_arrival(marketplace: Marketplace, customer: Customer) -> Dict:
+def simulate_customer_arrival(marketplace: Marketplace, customer: Customer, skip_arrival_check: bool = False) -> Dict:
     """
     Simulate a single customer arrival and decision using proper MNL model.
     
     First, customer decides if they will even open the app (arrival probability).
     Then, if they arrive, they see stores and make a choice using MNL.
+    
+    Args:
+        skip_arrival_check: If True, skip the arrival probability check (used when
+                          arrival decision is pre-generated for fair comparison)
     """
     # Stage 1: Customer decides if they will open the app today
     # Realistic behavior: Not all customers open the app every day
-    # Base arrival probability (can be adjusted based on customer characteristics)
-    base_arrival_probability = 0.7  # 70% base chance customer opens app on a given day
-    
-    # Adjust based on customer satisfaction (satisfied customers more likely to return)
-    # satisfaction_level is typically 0.5-1.0, so multiplier ranges from 1.0 to 1.5
-    satisfaction_multiplier = 0.5 + customer.satisfaction_level
-    arrival_probability = base_arrival_probability * satisfaction_multiplier
-    
-    # Clamp to valid probability range [0, 1]
-    arrival_probability = min(1.0, max(0.0, arrival_probability))
-    
-    # Customer decides if they open the app
-    if np.random.uniform() > arrival_probability:
-        # Customer doesn't open app today
-        return {
-            'action': 'no_arrival',  # New action: customer didn't even arrive
-            'store_id': None
-        }
+    if not skip_arrival_check:
+        # Base arrival probability (can be adjusted based on customer characteristics)
+        base_arrival_probability = 0.7  # 70% base chance customer opens app on a given day
+        
+        # Adjust based on customer satisfaction (satisfied customers more likely to return)
+        # satisfaction_level is typically 0.5-1.0, so multiplier ranges from 1.0 to 1.5
+        satisfaction_multiplier = 0.5 + customer.satisfaction_level
+        arrival_probability = base_arrival_probability * satisfaction_multiplier
+        
+        # Clamp to valid probability range [0, 1]
+        arrival_probability = min(1.0, max(0.0, arrival_probability))
+        
+        # Customer decides if they open the app
+        if np.random.uniform() > arrival_probability:
+            # Customer doesn't open app today
+            return {
+                'action': 'no_arrival',  # New action: customer didn't even arrive
+                'store_id': None
+            }
     
     # Customer opens app - proceed with decision
     customer_arrives(customer)
@@ -192,19 +197,38 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     stores_copy = copy.deepcopy(stores)
     customers_copy = copy.deepcopy(customers)
     
-    # Generate ALL arrival times upfront for all 10 days using a separate RNG
+    # Generate ALL arrival times AND arrival decisions upfront for all 10 days using separate RNGs
     # This ensures fair comparison: all strategies see the same arrival patterns
     # regardless of how much randomness each strategy uses during processing
     arrival_rng = np.random.RandomState(seed)
     all_days_arrival_times = []
+    all_days_arrival_decisions = []  # For each day: list of (customer_idx, will_arrive) tuples
+    
+    base_arrival_probability = 0.7  # Base chance customer opens app
+    
     for day in range(10):
         # Use day number as offset to ensure different but deterministic arrival times per day
         day_rng = np.random.RandomState(seed + day * 10000)
         arrival_times = sorted(day_rng.uniform(0, duration, len(customers_copy)))
         all_days_arrival_times.append(arrival_times)
+        
+        # Pre-generate arrival decisions for this day based on initial customer satisfaction
+        # Use a separate RNG offset for arrival decisions
+        decision_rng = np.random.RandomState(seed + day * 10000 + 5000)
+        day_arrival_decisions = []
+        for i, customer in enumerate(customers_copy):
+            # Use customer's initial satisfaction level (before any strategy effects)
+            satisfaction_multiplier = 0.5 + customer.satisfaction_level
+            arrival_probability = base_arrival_probability * satisfaction_multiplier
+            arrival_probability = min(1.0, max(0.0, arrival_probability))
+            
+            # Pre-generate the decision
+            will_arrive = decision_rng.uniform() <= arrival_probability
+            day_arrival_decisions.append((i, will_arrive))
+        all_days_arrival_decisions.append(day_arrival_decisions)
     
     # Reset main RNG to seed for strategy-specific randomness
-    # This ensures strategies can use randomness without affecting arrival times
+    # This ensures strategies can use randomness without affecting arrival times/decisions
     np.random.seed(seed)
     
     # Monkey patch select_stores to use the strategy
@@ -235,8 +259,13 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         marketplace.current_time = 0.0
         marketplace.customers = []
         
-        # Use pre-generated arrival times for this day
+        # Use pre-generated arrival times and decisions for this day
         arrival_times = all_days_arrival_times[day - 1]
+        arrival_decisions = all_days_arrival_decisions[day - 1]
+        
+        # Create a dict for quick lookup: customer_idx -> will_arrive
+        arrival_decision_dict = {idx: will_arrive for idx, will_arrive in arrival_decisions}
+        
         for i, customer in enumerate(customers_copy):
             customer.arrival_time = arrival_times[i]
             customer.decision = None
@@ -253,7 +282,19 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # Process each customer arrival in order
         # Customers cannot cancel their own orders - only restaurant inventory shortage causes cancellations
         for customer in customers_sorted:
-            decision = simulate_customer_arrival(marketplace, customer)
+            # Check pre-generated arrival decision
+            customer_idx = customers_copy.index(customer)
+            will_arrive = arrival_decision_dict.get(customer_idx, True)  # Default to True if not found
+            
+            if not will_arrive:
+                # Customer doesn't open app today (pre-determined)
+                decision = {
+                    'action': 'no_arrival',
+                    'store_id': None
+                }
+            else:
+                # Customer opens app - proceed with decision
+                decision = simulate_customer_arrival(marketplace, customer, skip_arrival_check=True)
             
             # --- STRATEGY LEARNING HOOK ---
             # Update strategy if it has learning capabilities (e.g. Anan_Strategy)
