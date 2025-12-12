@@ -181,9 +181,12 @@ def process_end_of_day(marketplace: Marketplace) -> Dict:
 
 def run_single_strategy_simulation(strategy, strategy_name: str, stores, customers, n: int,
                                    duration: float, seed: int, output_dir: str, 
-                                   verbose: bool = False) -> Dict:
+                                   verbose: bool = False, num_days: int = 10) -> Dict:
     """
-    Run 10-day simulation with a specific strategy.
+    Run multi-day simulation with a specific strategy.
+    
+    Args:
+        num_days: Number of days to simulate (default: 10)
     """
     import pandas as pd
     from ranking_algorithm import GreedyStrategy
@@ -197,7 +200,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     stores_copy = copy.deepcopy(stores)
     customers_copy = copy.deepcopy(customers)
     
-    # Generate ALL arrival times AND arrival decisions upfront for all 10 days using separate RNGs
+    # Generate ALL arrival times AND arrival decisions upfront for all days using separate RNGs
     # This ensures fair comparison: all strategies see the same arrival patterns
     # regardless of how much randomness each strategy uses during processing
     arrival_rng = np.random.RandomState(seed)
@@ -206,7 +209,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     
     base_arrival_probability = 0.7  # Base chance customer opens app
     
-    for day in range(10):
+    for day in range(num_days):
         # Use day number as offset to ensure different but deterministic arrival times per day
         day_rng = np.random.RandomState(seed + day * 10000)
         arrival_times = sorted(day_rng.uniform(0, duration, len(customers_copy)))
@@ -243,10 +246,10 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     customer_daily_activities = []
     daily_kpis_list = []
     
-    # Run 10 days
-    for day in range(1, 11):
-        if verbose and (day % 5 == 0 or day == 1):
-            print(f"  [{strategy_name}] Day {day}/10...")
+    # Run simulation for specified number of days
+    for day in range(1, num_days + 1):
+        if verbose and (day % 5 == 0 or day == 1 or day == num_days):
+            print(f"  [{strategy_name}] Day {day}/{num_days}...")
         
         # Initialize day for stores (resets counters on the COPIED stores)
         initialize_day(stores_copy)
@@ -379,7 +382,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'profit_margin': np.mean([k.get('profit_margin', 0.0) for k in daily_kpis_list]),
         'revenue_per_customer': np.mean([k.get('revenue_per_customer', 0.0) for k in daily_kpis_list]),
         'avg_store_accuracy': np.mean([k.get('avg_store_accuracy', 0.0) for k in daily_kpis_list]),
-        'total_days': 10
+        'total_days': num_days
     }
     
     return {
@@ -393,9 +396,14 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
 def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Optional[int] = None,
                       duration: float = 24.0, verbose: bool = True, seed: Optional[int] = None,
                       stores_csv: Optional[str] = None, customers_csv: Optional[str] = None,
-                      output_dir: str = "simulation_results") -> Dict:
+                      output_dir: str = "simulation_results", num_days: int = 10) -> Dict:
     """
-    Run 10-day simulation with Greedy (baseline) and Near-Optimal strategies and compare KPIs.
+    Run multi-day simulation with Greedy (baseline) and Near-Optimal strategies and compare KPIs.
+    
+    Args:
+        num_days: Number of days to simulate (default: 10)
+        num_stores: Target number of stores (if CSV provided, will generate additional if needed)
+        num_customers: Target number of customers (if CSV provided, will generate additional if needed)
     
     Returns:
         Dict with:
@@ -414,17 +422,74 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     if verbose:
         print("="*90)
         print("COMPARING RANKING STRATEGIES (5-WAY)")
-        print(f"Random Seed: {seed}")
+        print(f"Random Seed: {seed}, Days: {num_days}")
         print("="*90)
         print()
     
-    # Generate stores randomly (don't read from CSV)
-    stores = load_store_data(num_stores, num_customers=num_customers, seed=seed)
+    # Load or generate stores
+    stores = []
+    if stores_csv and os.path.exists(stores_csv):
+        if verbose:
+            print(f"Loading stores from {stores_csv}...")
+        stores = load_stores_from_csv(stores_csv)
+        csv_num_stores = len(stores)
+        
+        # Generate additional stores if needed
+        if num_stores > csv_num_stores:
+            additional_stores_needed = num_stores - csv_num_stores
+            if verbose:
+                print(f"  Loaded {csv_num_stores} stores from CSV, generating {additional_stores_needed} more...")
+            # Get max store ID to avoid conflicts
+            max_store_id = max([s.restaurant_id for s in stores]) if stores else 0
+            additional_stores = load_store_data(additional_stores_needed, num_customers=num_customers, seed=seed)
+            # Reassign IDs to avoid conflicts
+            for i, store in enumerate(additional_stores):
+                store.restaurant_id = max_store_id + 1 + i
+            stores.extend(additional_stores)
+        elif verbose:
+            print(f"  Loaded {csv_num_stores} stores from CSV")
+    else:
+        if verbose:
+            print(f"Generating {num_stores} stores...")
+        stores = load_store_data(num_stores, num_customers=num_customers, seed=seed)
+    
     num_stores = len(stores)
     
-    # Generate customers randomly (don't read from CSV)
-    arrival_times = sorted(np.random.uniform(0, duration, num_customers))
-    customers = generate_customer(num_customers, arrival_times, seed=seed)
+    # Load or generate customers
+    customers = []
+    if customers_csv and os.path.exists(customers_csv):
+        if verbose:
+            print(f"Loading customers from {customers_csv}...")
+        # Generate arrival times for all customers (will be trimmed/adjusted if needed)
+        arrival_times = sorted(np.random.uniform(0, duration, num_customers))
+        customers = load_customers_from_csv(customers_csv, arrival_times, seed=seed)
+        csv_num_customers = len(customers)
+        
+        # Generate additional customers if needed
+        if num_customers > csv_num_customers:
+            additional_customers_needed = num_customers - csv_num_customers
+            if verbose:
+                print(f"  Loaded {csv_num_customers} customers from CSV, generating {additional_customers_needed} more...")
+            # Get max customer ID to avoid conflicts
+            max_customer_id = max([c.customer_id for c in customers]) if customers else 0
+            additional_arrival_times = sorted(np.random.uniform(0, duration, additional_customers_needed))
+            additional_customers = generate_customer(additional_customers_needed, additional_arrival_times, seed=seed)
+            # Reassign IDs to avoid conflicts
+            for i, customer in enumerate(additional_customers):
+                customer.customer_id = max_customer_id + 1 + i
+            customers.extend(additional_customers)
+        elif verbose:
+            print(f"  Loaded {csv_num_customers} customers from CSV")
+        
+        # Trim to exact number if we have more than requested
+        if len(customers) > num_customers:
+            customers = customers[:num_customers]
+    else:
+        if verbose:
+            print(f"Generating {num_customers} customers...")
+        arrival_times = sorted(np.random.uniform(0, duration, num_customers))
+        customers = generate_customer(num_customers, arrival_times, seed=seed)
+    
     num_customers = len(customers)
     
     # Calculate n
@@ -440,7 +505,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 1. Greedy Strategy (Baseline)
     greedy_strategy = GreedyStrategy()
     greedy_results = run_single_strategy_simulation(
-        greedy_strategy, "Greedy", stores, customers, n_value, duration, seed, output_dir, verbose
+        greedy_strategy, "Greedy", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
     
     if verbose:
@@ -449,7 +514,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 2. Near-Optimal Strategy
     near_optimal_strategy = NearOptimalStrategy(exploration_rate=0.03)
     near_optimal_results = run_single_strategy_simulation(
-        near_optimal_strategy, "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose
+        near_optimal_strategy, "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
 
     if verbose:
@@ -458,7 +523,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 3. RWES_T Strategy
     rwes_t_strategy = RWES_T_Strategy_Wrapper()
     rwes_t_results = run_single_strategy_simulation(
-        rwes_t_strategy, "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose
+        rwes_t_strategy, "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
 
     if verbose:
@@ -467,7 +532,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 4. Anan Strategy
     anan_strategy = Anan_Strategy(customers, stores)
     anan_results = run_single_strategy_simulation(
-        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose
+        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
 
     if verbose:
@@ -476,7 +541,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     # 5. Yomna Strategy
     yomna_strategy = Yomna_Strategy()
     yomna_results = run_single_strategy_simulation(
-        yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose
+        yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
     
     # Calculate metrics for comparison

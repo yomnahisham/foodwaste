@@ -25,6 +25,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Food Waste Simulation")
     parser.add_argument("--data", choices=["default", "generate", "use_generated"], default="default",
                         help="Data source: 'default' (example_*.csv), 'generate' (make new), 'use_generated' (generated_*.csv)")
+    parser.add_argument("--days", type=int, default=10,
+                        help="Number of days to simulate (default: 10)")
+    parser.add_argument("--stores", type=int, default=None,
+                        help="Target number of stores (if CSV provided, will generate additional if needed)")
+    parser.add_argument("--customers", type=int, default=None,
+                        help="Target number of customers (if CSV provided, will generate additional if needed)")
     args = parser.parse_args()
 
     # Determine files to use based on args
@@ -64,31 +70,42 @@ if __name__ == "__main__":
     # Check existence of selected files
     has_csv_data = os.path.exists(stores_file) and os.path.exists(customers_file)
     
+    # Determine number of stores and customers
+    num_stores = args.stores if args.stores is not None else 15
+    num_customers = args.customers if args.customers is not None else 70
+    
     if has_csv_data:
         print(f"Found CSV files ({stores_file} and {customers_file})")
-        print("  Running 10-day comparison with CSV data...")
+        print(f"  Running {args.days}-day comparison with CSV data...")
+        if args.stores or args.customers:
+            print(f"  Target: {num_stores} stores, {num_customers} customers")
+            print(f"  (Will generate additional if CSV has fewer)")
         print()
         
         # Run comparison with CSV data
         results = compare_strategies(
             stores_csv=stores_file,
             customers_csv=customers_file,
+            num_stores=num_stores,
+            num_customers=num_customers,
             n=5,  # Number of stores to display to each customer
             verbose=True,
             seed=None,
-            output_dir="simulation_results"
+            output_dir="simulation_results",
+            num_days=args.days
         )
     else:
         print(f"CSV files not found: {stores_file}, {customers_file}")
-        print("Running 10-day comparison with purely synthetic data (no file loading).")
+        print(f"Running {args.days}-day comparison with purely synthetic data (no file loading).")
         print()
         
         # Run comparison with synthetic data
         results = compare_strategies(
-            num_stores=15,
-            num_customers=70,
+            num_stores=num_stores,
+            num_customers=num_customers,
             n=7,
             verbose=True,
             seed=None,
-            output_dir="simulation_results"
+            output_dir="simulation_results",
+            num_days=args.days
         )
