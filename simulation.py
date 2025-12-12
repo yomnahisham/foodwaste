@@ -195,44 +195,45 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
     np.random.seed(seed)
     
     # Deep copy stores and customers to avoid state contamination
-    # This is CRITICAL: each strategy run starts with fresh state
+    # each strategy run starts with fresh state
     import copy
     stores_copy = copy.deepcopy(stores)
     customers_copy = copy.deepcopy(customers)
     
-    # Generate ALL arrival times AND arrival decisions upfront for all days using separate RNGs
-    # This ensures fair comparison: all strategies see the same arrival patterns
+    # Update strategy's internal references to point to the copies instead of originals
+    # This ensures that updates during simulation (e.g., learned_preferences) affect
+    # the same objects the strategy uses for collaborative filtering
+    if hasattr(strategy, 'customer_db') and strategy.customer_db is not None:
+        # Find corresponding customers in the copy by ID
+        customer_id_to_copy = {c.customer_id: c for c in customers_copy}
+        strategy.customer_db = [customer_id_to_copy.get(c.customer_id, c) 
+                               for c in strategy.customer_db]
+    
+    if hasattr(strategy, 'restaurants_db') and strategy.restaurants_db is not None:
+        # Find corresponding stores in the copy by ID
+        store_id_to_copy = {s.restaurant_id: s for s in stores_copy}
+        strategy.restaurants_db = [store_id_to_copy.get(s.restaurant_id, s) 
+                                   for s in strategy.restaurants_db]
+    
+    # Generate ALL arrival times upfront for all days using separate RNGs
+    # This ensures fair comparison: all strategies see the same arrival time patterns
     # regardless of how much randomness each strategy uses during processing
     arrival_rng = np.random.RandomState(seed)
     all_days_arrival_times = []
-    all_days_arrival_decisions = []  # For each day: list of (customer_idx, will_arrive) tuples
-    
-    base_arrival_probability = 0.7  # Base chance customer opens app
     
     for day in range(num_days):
         # Use day number as offset to ensure different but deterministic arrival times per day
         day_rng = np.random.RandomState(seed + day * 10000)
         arrival_times = sorted(day_rng.uniform(0, duration, len(customers_copy)))
         all_days_arrival_times.append(arrival_times)
-        
-        # Pre-generate arrival decisions for this day based on initial customer satisfaction
-        # Use a separate RNG offset for arrival decisions
-        decision_rng = np.random.RandomState(seed + day * 10000 + 5000)
-        day_arrival_decisions = []
-        for i, customer in enumerate(customers_copy):
-            # Use customer's initial satisfaction level (before any strategy effects)
-            satisfaction_multiplier = 0.5 + customer.satisfaction_level
-            arrival_probability = base_arrival_probability * satisfaction_multiplier
-            arrival_probability = min(1.0, max(0.0, arrival_probability))
-            
-            # Pre-generate the decision
-            will_arrive = decision_rng.uniform() <= arrival_probability
-            day_arrival_decisions.append((i, will_arrive))
-        all_days_arrival_decisions.append(day_arrival_decisions)
     
     # Reset main RNG to seed for strategy-specific randomness
-    # This ensures strategies can use randomness without affecting arrival times/decisions
+    # This ensures strategies can use randomness without affecting arrival times
     np.random.seed(seed)
+    
+    # Note: Arrival decisions are NOT pre-generated for all days upfront.
+    # Instead, they are generated at the start of each day based on CURRENT customer satisfaction levels. 
+    # This allows satisfaction changes during simulation to affect future arrival probabilities, while still maintaining determinism through the use of a deterministic RNG seed per day
     
     # Monkey patch select_stores to use the strategy
     original_select_stores = ranking_algorithm.select_stores
@@ -262,12 +263,25 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         marketplace.current_time = 0.0
         marketplace.customers = []
         
-        # Use pre-generated arrival times and decisions for this day
+        # Use pre-generated arrival times for this day
         arrival_times = all_days_arrival_times[day - 1]
-        arrival_decisions = all_days_arrival_decisions[day - 1]
         
-        # Create a dict for quick lookup: customer_idx -> will_arrive
-        arrival_decision_dict = {idx: will_arrive for idx, will_arrive in arrival_decisions}
+        # Generate arrival decisions for this day based on CURRENT customer satisfaction
+        # This allows satisfaction changes from previous days to affect arrival probabilities
+        # Use a deterministic RNG seed per day to ensure fair comparison across strategies
+        base_arrival_probability = 0.7  # Base chance customer opens app
+        decision_rng = np.random.RandomState(seed + (day - 1) * 10000 + 5000)
+        arrival_decision_dict = {}
+        
+        for i, customer in enumerate(customers_copy):
+            # Use customer's CURRENT satisfaction level (may have changed from previous days)
+            satisfaction_multiplier = 0.5 + customer.satisfaction_level
+            arrival_probability = base_arrival_probability * satisfaction_multiplier
+            arrival_probability = min(1.0, max(0.0, arrival_probability))
+            
+            # Generate the decision using deterministic RNG
+            will_arrive = decision_rng.uniform() <= arrival_probability
+            arrival_decision_dict[i] = will_arrive
         
         for i, customer in enumerate(customers_copy):
             customer.arrival_time = arrival_times[i]
@@ -460,8 +474,15 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     if customers_csv and os.path.exists(customers_csv):
         if verbose:
             print(f"Loading customers from {customers_csv}...")
-        # Generate arrival times for all customers (will be trimmed/adjusted if needed)
-        arrival_times = sorted(np.random.uniform(0, duration, num_customers))
+        # First, read CSV to get actual row count before generating arrival times
+        # This ensures we generate enough arrival times for all CSV customers
+        import pandas as pd
+        df = pd.read_csv(customers_csv)
+        csv_actual_count = len(df)
+        
+        # Generate arrival times based on actual CSV size (not target num_customers)
+        # This prevents extra CSV customers from all getting the same arrival time
+        arrival_times = sorted(np.random.uniform(0, duration, csv_actual_count))
         customers = load_customers_from_csv(customers_csv, arrival_times, seed=seed)
         csv_num_customers = len(customers)
         
