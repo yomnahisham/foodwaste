@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
+import functools
 
 from restaurant_api import (
     Restaurant, load_store_data, get_all_stores, initialize_day,
@@ -18,7 +20,7 @@ from restaurant_api import (
 )
 from customer_api import (
     Customer, generate_customer, customer_arrives, display_stores_to_customer,
-    customer_makes_decision
+    customer_makes_decision, PRICE_ELASTICITY
 )
 from ranking_algorithm import select_stores, RankingStrategy
 import ranking_algorithm
@@ -37,6 +39,8 @@ class Marketplace:
         self.total_waste = 0
         self.total_customers_seen = 0
         self.n = None  # number of stores to show (constant for the day)
+        # network effects: track popular stores for social proof
+        self.store_popularity = {}  # {store_id: popularity_score} - updated based on recent orders
 
 
 def calculate_n(num_stores: int, expected_customers: int, total_estimated_inventory: int = None) -> int:
@@ -72,12 +76,49 @@ def is_peak_hour(hour: float) -> bool:
     return (11.0 <= hour < 14.0) or (17.0 <= hour < 21.0)
 
 
+def get_seasonal_multiplier(day: int) -> float:
+    """
+    get seasonal demand multiplier based on day number.
+    simulates monthly/quarterly patterns and holidays.
+    
+    patterns:
+    - december (holidays): 1.4x demand
+    - january (new year): 1.2x demand
+    - summer months (june-august): 1.1x demand
+    - spring/fall: 1.0x (baseline)
+    - thanksgiving week: 1.5x demand
+    """
+    # approximate month from day (assuming ~30 days per month)
+    month = (day // 30) % 12 + 1  # 1-12
+    
+    # base seasonal multipliers
+    seasonal_mult = 1.0
+    if month == 12:  # december (holidays)
+        seasonal_mult = 1.4
+    elif month == 1:  # january (new year)
+        seasonal_mult = 1.2
+    elif month in [6, 7, 8]:  # summer
+        seasonal_mult = 1.1
+    elif month == 11:  # november (thanksgiving)
+        seasonal_mult = 1.3
+    
+    # holiday effects (thanksgiving week, christmas week)
+    day_in_month = day % 30
+    if month == 11 and 20 <= day_in_month <= 27:  # thanksgiving week
+        seasonal_mult = 1.5
+    elif month == 12 and 20 <= day_in_month <= 27:  # christmas week
+        seasonal_mult = 1.6
+    
+    return seasonal_mult
+
+
 def generate_time_weighted_arrival_times(num_customers: int, duration: float = 24.0, 
-                                        rng: np.random.RandomState = None, is_weekend: bool = False) -> List[float]:
+                                        rng: np.random.RandomState = None, is_weekend: bool = False,
+                                        seasonal_multiplier: float = 1.0) -> List[float]:
     """
     generate arrival times with realistic time-of-day demand patterns.
     creates peaks at lunch (11am-2pm) and dinner (5pm-9pm).
-    adjusts for weekday vs weekend patterns.
+    adjusts for weekday vs weekend patterns and seasonal effects.
     
     weekday time multipliers:
     - morning (6am-11am): 0.3x
@@ -90,6 +131,8 @@ def generate_time_weighted_arrival_times(num_customers: int, duration: float = 2
     - overall demand: 1.3x multiplier
     - dinner peak later: 6pm-9pm instead of 5pm-9pm
     - lunch less pronounced: 1.2x instead of 1.5x
+    
+    seasonal_multiplier: additional multiplier for seasonal/holiday effects
     """
     if rng is None:
         rng = np.random.RandomState()
@@ -116,10 +159,14 @@ def generate_time_weighted_arrival_times(num_customers: int, duration: float = 2
             (21.0, 24.0, 0.2),  # late night: 0.2x
         ]
     
+    # apply seasonal multiplier to all periods
+    time_periods = [(start, end, mult * seasonal_multiplier) for start, end, mult in time_periods]
+    
     # calculate total weight for normalization
     total_weight = sum((end - start) * mult for start, end, mult in time_periods)
     
     # generate arrival times using weighted distribution
+    # seasonal multiplier affects the weights, not the count (to maintain fair comparison)
     arrival_times = []
     for _ in range(num_customers):
         # sample a time period weighted by duration * multiplier
@@ -307,8 +354,10 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # calculate day of week for day-specific patterns
         day_of_week = day % 7
         is_weekend = day_of_week >= 5  # Saturday (5) or Sunday (6)
-        # generate time-weighted arrival times with realistic peaks (adjusted for weekday/weekend)
-        arrival_times = generate_time_weighted_arrival_times(len(customers_copy), duration, day_rng, is_weekend)
+        # get seasonal multiplier for this day
+        seasonal_mult = get_seasonal_multiplier(day)
+        # generate time-weighted arrival times with realistic peaks (adjusted for weekday/weekend and seasonal effects)
+        arrival_times = generate_time_weighted_arrival_times(len(customers_copy), duration, day_rng, is_weekend, seasonal_mult)
         all_days_arrival_times.append(arrival_times)
     
     # reset main RNG to seed for strategy-specific randomness
@@ -343,6 +392,15 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # initialize day for stores (resets counters on the copied stores)
         initialize_day(stores_copy)
         
+        # stores may start promotions at beginning of day
+        # simulate some stores running promotions (e.g., low inventory stores)
+        promotion_rng = np.random.RandomState(seed + day * 20000)
+        for store in stores_copy:
+            # stores with low inventory more likely to promote
+            if store.est_inventory < 5 and promotion_rng.uniform() < 0.3:
+                discount = promotion_rng.uniform(10, 25)  # 10-25% discount
+                store.start_promotion('discount', discount, duration_hours=6.0, start_time=0.0)
+        
         # update churn status: increment days since churn for churned customers
         for customer in customers_copy:
             if customer.is_churned:
@@ -355,6 +413,28 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         marketplace.total_customers_seen = 0
         marketplace.current_time = 0.0
         marketplace.customers = []
+        
+        # update network effects: propagate social influence from previous day
+        # popular stores from previous day influence customer preferences
+        if day > 1:
+            # decay previous popularity (exponential decay)
+            for store_id in marketplace.store_popularity:
+                marketplace.store_popularity[store_id] *= 0.7  # 30% decay per day
+            
+            # update customer social influence scores based on store popularity
+            max_popularity = max(marketplace.store_popularity.values()) if marketplace.store_popularity else 1.0
+            for customer in customers_copy:
+                for store_id, popularity in marketplace.store_popularity.items():
+                    # normalize popularity and assign to customer
+                    normalized_popularity = popularity / max(1.0, max_popularity)
+                    customer.social_influence_score[store_id] = normalized_popularity
+        
+        # reset store popularity for new day (will be built up during the day)
+        marketplace.store_popularity = {}
+        
+        # reset store recent orders count for network effects
+        for store in stores_copy:
+            store.recent_orders_count = 0
         
         # use pre-generated arrival times for this day
         arrival_times = all_days_arrival_times[day - 1]
@@ -418,6 +498,12 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         offpeak_cancellations = {}
         offpeak_waste = {}
         
+        # track segment-specific metrics
+        segment_orders = {}  # {segment: count} - orders by segment
+        segment_revenue = {}  # {segment: float} - revenue by segment
+        segment_cancellations = {}  # {segment: count} - cancellations by segment
+        segment_customers = {}  # {segment: set} - customers who arrived by segment
+        
         # calculate expected sales rate for mid-day inventory updates
         total_expected_sales = sum(s.est_inventory for s in stores_copy)
         expected_sales_rate = total_expected_sales / duration if duration > 0 else 0
@@ -443,6 +529,10 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             # update customer history based on their action
             if decision['action'] == 'buy' and decision.get('store_id'):
                 customer.add_to_history(decision['store_id'], 'order')
+                # track order for CLV calculation
+                store = next((s for s in stores_copy if s.restaurant_id == decision['store_id']), None)
+                if store:
+                    customer.record_order(day, store.price)
             elif decision['action'] != 'no_arrival' and customer.displayed_stores:
                 # customer viewed stores but didn't buy - add viewed stores to history
                 for store_id in customer.displayed_stores:
@@ -467,6 +557,15 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             }
             customer_daily_activities.append(activity)
             
+            # track segment for customers who arrived
+            if will_arrive:
+                segment = customer.customer_segment
+                if segment not in segment_customers:
+                    segment_customers[segment] = set()
+                segment_customers[segment].add(customer.customer_id)
+                # record activity for retention tracking
+                customer.record_activity(day)
+            
             # only track orders (not no_arrival or leave)
             if decision['action'] == 'buy':
                 customer_orders_today[customer.customer_id] = decision['store_id']
@@ -477,18 +576,65 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
                     peak_reservations[store_id] = peak_reservations.get(store_id, 0) + 1
                 else:
                     offpeak_reservations[store_id] = offpeak_reservations.get(store_id, 0) + 1
+                
+                # track segment-specific metrics
+                segment = customer.customer_segment
+                segment_orders[segment] = segment_orders.get(segment, 0) + 1
+                store = next((s for s in stores_copy if s.restaurant_id == store_id), None)
+                if store:
+                    segment_revenue[segment] = segment_revenue.get(segment, 0.0) + store.price
+                    # network effects: update store popularity (social proof)
+                    marketplace.store_popularity[store_id] = marketplace.store_popularity.get(store_id, 0.0) + 1.0
+                    store.recent_orders_count += 1
             
             customers_processed += 1
             
-            # update mid-day inventory estimates periodically (every 10 customers)
-            # this allows stores to adjust estimates based on sales velocity
+            # update mid-day inventory estimates, dynamic pricing, and promotions periodically (every 10 customers)
+            # this allows stores to adjust estimates and prices based on sales velocity and demand
             if customers_processed % 10 == 0:
                 time_elapsed = customer.arrival_time
+                is_peak = is_peak_hour(time_elapsed)
                 for store in stores_copy:
                     store.update_midday_inventory_estimate(expected_sales_rate, time_elapsed, duration)
+                    # update promotions (check if expired)
+                    store.update_promotion(time_elapsed)
+                    # update dynamic pricing (only if no active promotion)
+                    if not store.active_promotion:
+                        inventory_ratio = (store.est_inventory - store.reservation_count) / max(1, store.est_inventory)
+                        demand_pressure = store.reservation_count / max(1, expected_sales_rate * (time_elapsed / duration))
+                        store.update_dynamic_price(time_elapsed, is_peak, inventory_ratio, demand_pressure)
         
         # end of day processing
         day_results = process_end_of_day(marketplace)
+        
+        # update competition dynamics: calculate market share and competitive positioning
+        # do this after end-of-day processing so we have final order counts
+        total_orders_today = sum(s.completed_order_count for s in stores_copy)
+        market_shares = []
+        leader_count = 0
+        follower_count = 0
+        if total_orders_today > 0:
+            for store in stores_copy:
+                store.market_share = (store.completed_order_count / total_orders_today) * 100
+                market_shares.append(store.market_share)
+                # update competitive position based on market share
+                if store.market_share > 15.0:  # top performer
+                    store.competitive_position = 'leader'
+                    leader_count += 1
+                elif store.market_share < 3.0:  # low performer
+                    store.competitive_position = 'follower'
+                    follower_count += 1
+                else:
+                    store.competitive_position = 'neutral'
+                # track revenue for competitive analysis
+                if not hasattr(store, 'revenue_history'):
+                    store.revenue_history = []
+                store.revenue_history.append(store.completed_order_count * store.price)
+        
+        # calculate HHI (Herfindahl-Hirschman Index) for market concentration
+        # HHI = sum of (market_share^2) * 10000 (ranges 0-10000)
+        hhi = sum((ms / 100.0) ** 2 for ms in market_shares) * 10000 if market_shares else 0.0
+        avg_market_share_day = np.mean(market_shares) if market_shares else 0.0
         
         # calculate peak vs off-peak metrics for supply-demand balance KPI
         # we need to determine which orders were completed/cancelled during peak hours
@@ -543,6 +689,15 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # cap fulfillment rate at 100% (can't fulfill more than reservations)
         offpeak_fulfillment_rate = min((offpeak_total_completed / offpeak_total_reservations * 100) if offpeak_total_reservations > 0 else 0.0, 100.0)
         offpeak_cancellation_rate = min((offpeak_total_cancellations / offpeak_total_reservations * 100) if offpeak_total_reservations > 0 else 0.0, 100.0)
+        
+        # track segment cancellations
+        for activity in customer_daily_activities:
+            if activity['day'] == day and activity['action'] == 'buy' and activity.get('cancelled', False):
+                customer_id = activity['customer_id']
+                customer = customer_id_to_obj.get(customer_id)
+                if customer:
+                    segment = customer.customer_segment
+                    segment_cancellations[segment] = segment_cancellations.get(segment, 0) + 1
         
         # update cancellation status and customer satisfaction
         # cancellations occur when restaurant's actual inventory < reservations
@@ -622,12 +777,69 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             'offpeak_fulfillment_rate': offpeak_fulfillment_rate,
             'offpeak_cancellation_rate': offpeak_cancellation_rate,
             'peak_reservations': peak_total_reservations,
-            'offpeak_reservations': offpeak_total_reservations
+            'offpeak_reservations': offpeak_total_reservations,
+            # segment-specific metrics
+            'segment_orders': segment_orders,
+            'segment_revenue': segment_revenue,
+            'segment_cancellations': segment_cancellations,
+            'segment_customers': {seg: len(customers) for seg, customers in segment_customers.items()},
+            # promotion metrics
+            'active_promotions': sum(1 for s in stores_copy if hasattr(s, 'active_promotion') and s.active_promotion),
+            'promotion_revenue': sum(s.price * s.completed_order_count for s in stores_copy 
+                                    if hasattr(s, 'active_promotion') and s.active_promotion),
+            # network effects metrics
+            'viral_stores': sum(1 for s in stores_copy if hasattr(s, 'recent_orders_count') and s.recent_orders_count > 5),
+            'total_social_influence': sum(sum(c.social_influence_score.values()) for c in customers_copy if hasattr(c, 'social_influence_score')),
+            # competition dynamics (daily)
+            'market_concentration_hhi': hhi,
+            'leader_stores': leader_count,
+            'follower_stores': follower_count,
+            'avg_market_share': avg_market_share_day
         }
         daily_kpis_list.append(daily_kpis)
     
     # Restore original select_stores
     ranking_algorithm.select_stores = original_select_stores
+    
+    # calculate customer lifetime value metrics
+    total_clv = sum(c.calculate_clv(num_days) for c in customers_copy)
+    avg_clv = total_clv / len(customers_copy) if customers_copy else 0.0
+    
+    # calculate CLV by segment
+    clv_by_segment = {}
+    segment_counts = {}
+    for customer in customers_copy:
+        segment = customer.customer_segment
+        clv = customer.calculate_clv(num_days)
+        clv_by_segment[segment] = clv_by_segment.get(segment, 0.0) + clv
+        segment_counts[segment] = segment_counts.get(segment, 0) + 1
+    
+    avg_clv_by_segment = {seg: clv_by_segment[seg] / segment_counts[seg] 
+                          for seg in clv_by_segment if segment_counts[seg] > 0}
+    
+    # calculate retention metrics
+    total_customers = len(customers_copy)
+    active_customers = sum(1 for c in customers_copy if c.total_orders > 0)
+    churned_customers = sum(1 for c in customers_copy if c.is_churned)
+    
+    # retention rate: customers who made at least one purchase in last 7 days
+    # vectorized calculation for performance
+    if customers_copy:
+        retention_rates = np.array([c.calculate_retention_rate(num_days, 7) for c in customers_copy])
+        retention_rate_7d = np.mean(retention_rates)
+    else:
+        retention_rate_7d = 0.0
+    
+    # churn rate: % of customers who are churned
+    churn_rate = (churned_customers / total_customers * 100) if total_customers > 0 else 0.0
+    
+    # customer acquisition: new customers (first order in simulation period)
+    new_customers = sum(1 for c in customers_copy if c.first_order_day is not None and c.first_order_day <= 3)
+    
+    # average customer lifespan (days from first to last order)
+    customer_lifespans = [c.last_order_day - c.first_order_day + 1 
+                          for c in customers_copy if c.first_order_day is not None and c.last_order_day is not None]
+    avg_customer_lifespan = np.mean(customer_lifespans) if customer_lifespans else 0.0
     
     # Calculate average KPIs
     avg_kpis = {
@@ -651,6 +863,28 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'avg_peak_supply_demand_ratio': np.mean([k.get('peak_supply_demand_ratio', 0.0) for k in daily_kpis_list]),
         'avg_offpeak_fulfillment_rate': np.mean([k.get('offpeak_fulfillment_rate', 0.0) for k in daily_kpis_list]),
         'avg_offpeak_cancellation_rate': np.mean([k.get('offpeak_cancellation_rate', 0.0) for k in daily_kpis_list]),
+        # customer lifetime value metrics
+        'avg_clv': avg_clv,
+        'total_clv': total_clv,
+        'clv_by_segment': avg_clv_by_segment,
+        # price elasticity tracking (aggregate across all customers)
+        'price_elasticity_avg': np.mean([PRICE_ELASTICITY.get(c.customer_segment, -1.0) for c in customers_copy]) if customers_copy else 0.0,
+        # segment-specific performance metrics (averaged across days)
+        'segment_avg_orders': {seg: np.mean([k.get('segment_orders', {}).get(seg, 0) for k in daily_kpis_list]) 
+                               for seg in ['PRICE_SENSITIVE', 'QUALITY_FOCUSED', 'LOYAL', 'EXPLORER', 'CONVENIENCE_SEEKER', 'BALANCED']},
+        'segment_avg_revenue': {seg: np.mean([k.get('segment_revenue', {}).get(seg, 0.0) for k in daily_kpis_list]) 
+                                for seg in ['PRICE_SENSITIVE', 'QUALITY_FOCUSED', 'LOYAL', 'EXPLORER', 'CONVENIENCE_SEEKER', 'BALANCED']},
+        'segment_avg_cancellations': {seg: np.mean([k.get('segment_cancellations', {}).get(seg, 0) for k in daily_kpis_list]) 
+                                       for seg in ['PRICE_SENSITIVE', 'QUALITY_FOCUSED', 'LOYAL', 'EXPLORER', 'CONVENIENCE_SEEKER', 'BALANCED']},
+        'segment_avg_customers': {seg: np.mean([k.get('segment_customers', {}).get(seg, 0) for k in daily_kpis_list]) 
+                                  for seg in ['PRICE_SENSITIVE', 'QUALITY_FOCUSED', 'LOYAL', 'EXPLORER', 'CONVENIENCE_SEEKER', 'BALANCED']},
+        # retention metrics
+        'retention_rate_7d': retention_rate_7d,
+        'churn_rate': churn_rate,
+        'active_customers': active_customers,
+        'churned_customers': churned_customers,
+        'new_customers': new_customers,
+        'avg_customer_lifespan': avg_customer_lifespan,
         'total_days': num_days
     }
     
@@ -720,7 +954,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     else:
         if verbose:
             print(f"Generating {num_stores} stores...")
-        stores = load_store_data(num_stores, num_customers=num_customers, seed=seed)
+    stores = load_store_data(num_stores, num_customers=num_customers, seed=seed)
     
     num_stores = len(stores)
     
@@ -763,8 +997,8 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     else:
         if verbose:
             print(f"Generating {num_customers} customers...")
-        arrival_times = sorted(np.random.uniform(0, duration, num_customers))
-        customers = generate_customer(num_customers, arrival_times, seed=seed)
+    arrival_times = sorted(np.random.uniform(0, duration, num_customers))
+    customers = generate_customer(num_customers, arrival_times, seed=seed)
     
     num_customers = len(customers)
     
@@ -778,46 +1012,65 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         print()
         print("Running Greedy Strategy (Baseline)...")
     
-    # 1. Greedy Strategy (Baseline)
+    # run strategies (can be parallelized for better performance)
+    # note: anan strategy needs original customers/stores, so we handle it separately
+    use_parallel = False  # set to True to enable parallel execution (requires picklable strategies)
+    
+    if use_parallel and cpu_count() > 1:
+        # parallel execution (for strategies that can be pickled)
+        def run_strategy_wrapper(args):
+            strategy, name, stores, customers, n, duration, seed, output_dir, verbose, num_days = args
+            return run_single_strategy_simulation(
+                strategy, name, stores, customers, n, duration, seed, output_dir, verbose, num_days
+            )
+        
+        strategy_configs = [
+            (GreedyStrategy(), "Greedy", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
+            (NearOptimalStrategy(exploration_rate=0.03), "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
+            (RWES_T_Strategy_Wrapper(), "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
+            (Yomna_Strategy(), "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
+        ]
+        
+        with Pool(min(4, cpu_count())) as pool:
+            results = pool.map(run_strategy_wrapper, strategy_configs)
+        
+        greedy_results, near_optimal_results, rwes_t_results, yomna_results = results
+    else:
+        # sequential execution (default, more reliable)
+        if verbose:
+            print("Running Greedy Strategy (Baseline)...")
     greedy_strategy = GreedyStrategy()
     greedy_results = run_single_strategy_simulation(
-        greedy_strategy, "Greedy", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+            greedy_strategy, "Greedy", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
     
     if verbose:
         print("\nRunning Near-Optimal Strategy...")
-    
-    # 2. Near-Optimal Strategy
     near_optimal_strategy = NearOptimalStrategy(exploration_rate=0.03)
     near_optimal_results = run_single_strategy_simulation(
-        near_optimal_strategy, "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+            near_optimal_strategy, "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
 
     if verbose:
         print("\nRunning RWES_T Strategy...")
-
-    # 3. RWES_T Strategy
     rwes_t_strategy = RWES_T_Strategy_Wrapper()
     rwes_t_results = run_single_strategy_simulation(
-        rwes_t_strategy, "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
-    )
-
-    if verbose:
-        print("\nRunning Anan Strategy (New)...")
-
-    # 4. Anan Strategy
-    anan_strategy = Anan_Strategy(customers, stores)
-    anan_results = run_single_strategy_simulation(
-        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+            rwes_t_strategy, "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
 
     if verbose:
         print("\nRunning Yomna Strategy (New)...")
-
-    # 5. Yomna Strategy
     yomna_strategy = Yomna_Strategy()
     yomna_results = run_single_strategy_simulation(
-        yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+            yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+        )
+    
+    # anan strategy needs original customers/stores (not parallelizable easily)
+    if verbose:
+        print("\nRunning Anan Strategy (New)...")
+    anan_strategy = Anan_Strategy(customers, stores)
+    anan_results = run_single_strategy_simulation(
+        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
     )
     
     # Calculate metrics for comparison

@@ -9,7 +9,11 @@ Handles all restaurant/store-related functionality including:
 """
 
 import numpy as np
-from typing import List, Dict, Optional
+import math
+from typing import List, Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from simulation import Marketplace
 
 class Restaurant:
     """Represents a restaurant/store in the marketplace"""
@@ -19,6 +23,7 @@ class Restaurant:
         self.name = name
         self.category = category
         self.price = 0.0
+        self.base_price = 0.0  # original price set at start of day
 
         self.rating = 0.0
         self.number_of_ratings = 0
@@ -34,11 +39,107 @@ class Restaurant:
         self.cancellation_count = 0
 
         self.exposure_count = 0
+        
+        # promotions tracking
+        self.active_promotion = None  # {'type': 'discount', 'discount_pct': 10, 'end_time': 21.0}
+        self.promotion_history = []  # list of promotions run
+        
+        # network effects tracking
+        self.social_proof_score = 0.0  # aggregate social proof from customer reviews/ratings
+        self.recent_orders_count = 0  # orders in last period (for viral effect)
+        
+        # competition dynamics tracking
+        self.market_share = 0.0  # % of total market orders
+        self.competitive_position = 'neutral'  # 'leader', 'follower', 'neutral'
+        self.revenue_history = []  # track revenue over time for competitive analysis
 
     def update_daily_supply(self, new_price, new_inventory):
         """Update daily supply and price"""
         self.price = new_price
+        self.base_price = new_price  # store base price for dynamic pricing
         self.est_inventory = new_inventory
+    
+    def update_dynamic_price(self, current_hour: float, is_peak: bool, 
+                           inventory_ratio: float, demand_pressure: float = 1.0):
+        """
+        dynamically adjust price based on market conditions.
+        
+        factors:
+        - peak hours: premium pricing (5-10% increase)
+        - low inventory: discount to clear (5-15% decrease)
+        - high inventory: slight discount to attract customers (2-5% decrease)
+        - demand pressure: adjust based on reservation rate
+        
+        price changes are bounded to prevent extreme swings
+        """
+        if self.base_price <= 0:
+            return  # can't adjust if no base price
+        
+        price_multiplier = 1.0
+        
+        # peak hour premium
+        if is_peak:
+            price_multiplier *= 1.05  # 5% premium during peak
+        
+        # inventory-based pricing
+        if inventory_ratio < 0.3:
+            # very low inventory - discount to clear remaining stock
+            price_multiplier *= 0.90  # 10% discount
+        elif inventory_ratio < 0.5:
+            # low inventory - small discount
+            price_multiplier *= 0.95  # 5% discount
+        elif inventory_ratio > 0.8:
+            # high inventory - small discount to attract customers
+            price_multiplier *= 0.97  # 3% discount
+        
+        # demand pressure adjustment
+        # if reservation rate is high relative to inventory, increase price
+        reservation_rate = self.reservation_count / max(1, self.est_inventory)
+        if reservation_rate > 0.8:
+            price_multiplier *= 1.03  # 3% increase for high demand
+        elif reservation_rate < 0.3:
+            price_multiplier *= 0.98  # 2% decrease for low demand
+        
+        # bound price changes (max 20% change from base)
+        price_multiplier = max(0.8, min(1.2, price_multiplier))
+        
+        # update price
+        self.price = self.base_price * price_multiplier
+    
+    def start_promotion(self, promotion_type: str = 'discount', discount_pct: float = 10.0, 
+                       duration_hours: float = 4.0, start_time: float = 0.0):
+        """
+        start a promotion (discount, flash sale, etc.)
+        
+        args:
+            promotion_type: 'discount', 'flash_sale', 'bogo'
+            discount_pct: percentage discount (0-100)
+            duration_hours: how long promotion lasts
+            start_time: when promotion starts (hour of day)
+        """
+        end_time = start_time + duration_hours
+        self.active_promotion = {
+            'type': promotion_type,
+            'discount_pct': discount_pct,
+            'start_time': start_time,
+            'end_time': min(24.0, end_time),
+            'original_price': self.price
+        }
+        # apply discount immediately
+        self.price = self.base_price * (1.0 - discount_pct / 100.0)
+    
+    def update_promotion(self, current_hour: float):
+        """update promotion status based on current time"""
+        if self.active_promotion and current_hour >= self.active_promotion['end_time']:
+            # promotion ended
+            self.promotion_history.append(self.active_promotion)
+            self.active_promotion = None
+            # restore base price (may be adjusted by dynamic pricing)
+            self.price = self.base_price
+    
+    def get_effective_price(self) -> float:
+        """get current effective price (with any active promotions)"""
+        return self.price
     
     def update_midday_inventory_estimate(self, expected_sales_rate: float, time_elapsed: float, total_duration: float = 24.0):
         """

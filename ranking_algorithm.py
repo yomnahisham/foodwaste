@@ -49,7 +49,9 @@ def select_stores(customer: Customer, n: int, all_stores: List[Restaurant], t: i
     target_exposure = t / m if m > 0 and t > 0 else 0
 
     # Get normalization factors for score components
+    # ensure max_price is never 0 (stores can't sell at 0)
     max_price = max([s.price for s in all_stores], default=1.0)
+    max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
     max_inventory = max([s.est_inventory for s in all_stores], default=1.0)
 
     for store in all_stores:
@@ -108,6 +110,7 @@ class GreedyStrategy(RankingStrategy):
         target_exposure = t / m if m > 0 and t > 0 else 0
 
         max_price = max([s.price for s in all_stores], default=1.0)
+        max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
         max_inventory = max([s.est_inventory for s in all_stores], default=1.0)
 
         for store in all_stores:
@@ -175,6 +178,7 @@ class HybridStrategy(RankingStrategy):
         
         # Scoring for exploration candidates
         max_price = max((s.price for s in all_stores), default=1.0)
+        max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
         max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
         total_stores = len(all_stores)
         
@@ -279,6 +283,7 @@ class OptimizedStrategy(RankingStrategy):
         
         # Normalization factors
         max_price = max((s.price for s in all_stores), default=1.0)
+        max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
         min_price = min((s.price for s in all_stores), default=1.0)
         max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
         total_stores = len(all_stores)
@@ -427,6 +432,7 @@ class NearOptimalStrategy(RankingStrategy):
         
         # Normalization factors
         max_price = max((s.price for s in all_stores), default=1.0)
+        max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
         min_price = min((s.price for s in all_stores), default=1.0)
         max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
         total_stores = len(all_stores)
@@ -604,7 +610,8 @@ def RWES_T(customer: Customer, n: int, all_stores: List[Restaurant], t: int) -> 
     exploration_weight = max(0.2, 1.0 - t / (len(all_stores) * 10))
 
     prices = [s.price for s in all_stores]
-    max_price = max(prices)
+    max_price = max(prices) if prices else 1.0
+    max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
 
     preferred_cats = customer.preferences.get('preferred_categories', [])
 
@@ -796,6 +803,7 @@ class Yomna_Strategy(RankingStrategy):
             return available[:n]
 
         max_price = max((s.price for s in all_stores), default=1.0)
+        max_price = max(max_price, 1.0)  # ensure minimum of 1.0 to prevent division by zero
         max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
 
         # Light personalization (small boost only)

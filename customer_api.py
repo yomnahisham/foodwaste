@@ -12,6 +12,7 @@ import numpy as np
 from typing import List, Dict, Optional
 from scipy.special import softmax
 from restaurant_api import Restaurant
+import functools
 
 
 class Customer:
@@ -62,16 +63,41 @@ class Customer:
         self.chosen_store_id = None
         self.displayed_stores = []
         
+        # network effects tracking
+        self.social_influence_score = {}  # {store_id: influence_score} - influenced by other customers
+        
         # churn tracking
         self.consecutive_cancellations = 0
         self.is_churned = False
         self.days_since_churn = 0
+        
+        # customer lifetime value (CLV) tracking
+        self.total_orders = 0
+        self.total_spent = 0.0
+        self.order_history_dates = []  # list of (day, order_value)
+        self.first_order_day = None
+        self.last_order_day = None
+        
+        # retention tracking
+        self.days_active = set()  # set of days customer made a purchase
+        self.first_seen_day = None
+        self.last_seen_day = None
+    
+    @functools.lru_cache(maxsize=1)
+    def _get_segment_cache_key(self) -> tuple:
+        """create cache key for segment calculation"""
+        max_price = self.preferences.get('max_price', 25.0)
+        min_rating = self.preferences.get('min_rating', 3.0)
+        has_orders = len(self.history.get('orders', [])) > 0
+        return (max_price, min_rating, has_orders, self.bias_score, self.neophila_score)
     
     def determine_segment(self) -> str:
         """
         derive customer segment from existing characteristics.
         segments emerge naturally from customer traits - no random assignment needed.
+        cached for performance.
         """
+        # use cached values for performance
         max_price = self.preferences.get('max_price', 25.0)
         min_rating = self.preferences.get('min_rating', 3.0)
         has_orders = len(self.history.get('orders', [])) > 0
@@ -103,6 +129,11 @@ class Customer:
     def customer_segment(self) -> str:
         """get customer segment (computed property)"""
         return self.determine_segment()
+    
+    def _clear_segment_cache(self):
+        """clear segment cache when customer traits change"""
+        if hasattr(self.determine_segment, 'cache_clear'):
+            self.determine_segment.cache_clear()
 
     def update_preferences(self, **kwargs):
         """Update customer preferences"""
@@ -115,6 +146,67 @@ class Customer:
                 self.history['viewedRestaurants'].append(store_id)
         elif action == 'order':
             self.history['orders'].append(store_id)
+    
+    def record_order(self, day: int, order_value: float):
+        """record an order for CLV calculation"""
+        self.total_orders += 1
+        self.total_spent += order_value
+        self.order_history_dates.append((day, order_value))
+        if self.first_order_day is None:
+            self.first_order_day = day
+        self.last_order_day = day
+        self.days_active.add(day)
+    
+    def record_activity(self, day: int):
+        """record customer activity (view or arrival) for retention tracking"""
+        if self.first_seen_day is None:
+            self.first_seen_day = day
+        self.last_seen_day = day
+    
+    def calculate_retention_rate(self, current_day: int, lookback_days: int = 7) -> float:
+        """calculate retention rate: % of recent days customer was active"""
+        if current_day <= lookback_days:
+            return 1.0 if self.total_orders > 0 else 0.0
+        
+        recent_days = [d for d in self.days_active if d > (current_day - lookback_days)]
+        return len(recent_days) / lookback_days if lookback_days > 0 else 0.0
+    
+    def calculate_clv(self, current_day: int, discount_rate: float = 0.1) -> float:
+        """
+        calculate customer lifetime value.
+        CLV = (average order value * purchase frequency * customer lifespan) / (1 + discount_rate)
+        
+        simplified formula for simulation:
+        CLV = total_spent * retention_multiplier
+        where retention_multiplier accounts for expected future value
+        """
+        if self.total_orders == 0:
+            return 0.0
+        
+        # calculate average order value
+        avg_order_value = self.total_spent / self.total_orders
+        
+        # calculate purchase frequency (orders per day active)
+        if self.first_order_day is not None:
+            days_active = max(1, current_day - self.first_order_day + 1)
+            purchase_frequency = self.total_orders / days_active
+        else:
+            purchase_frequency = 0.0
+        
+        # estimate customer lifespan (based on retention)
+        # if customer has been active, estimate future value
+        retention_probability = min(1.0, self.satisfaction_level)
+        if self.is_churned:
+            retention_probability *= 0.3  # churned customers have low retention
+        
+        # expected future orders (simplified: based on current frequency and retention)
+        expected_future_orders = purchase_frequency * 30 * retention_probability  # next 30 days
+        
+        # CLV = past value + expected future value (discounted)
+        past_value = self.total_spent
+        future_value = avg_order_value * expected_future_orders / (1 + discount_rate)
+        
+        return past_value + future_value
 
 
 # Global customer counter
@@ -263,6 +355,19 @@ SEGMENT_MULTIPLIERS = {
     'BALANCED': {'price': 1.0, 'rating': 1.0, 'familiarity': 1.0, 'neophilia': 1.0}
 }
 
+# price elasticity coefficients by segment
+# elasticity = % change in demand / % change in price
+# negative values mean demand decreases as price increases
+# more negative = more price sensitive
+PRICE_ELASTICITY = {
+    'PRICE_SENSITIVE': -2.5,  # very elastic: 10% price increase = 25% demand decrease
+    'QUALITY_FOCUSED': -0.5,  # inelastic: 10% price increase = 5% demand decrease
+    'LOYAL': -1.0,            # moderate elasticity
+    'EXPLORER': -1.2,         # moderate-high elasticity
+    'CONVENIENCE_SEEKER': -1.5,  # high elasticity
+    'BALANCED': -1.0          # moderate elasticity
+}
+
 
 class CustomerChoiceMNL:
     """
@@ -280,22 +385,59 @@ class CustomerChoiceMNL:
             'neophilia_boost': 0.8,  # STRONGER neophilia boost
             'leave_utility': 0.5  # LOWER leave utility (customers more likely to buy)
         }
+        # cache for utility calculations (store_id, customer_id) -> utility
+        self._utility_cache = {}
     
     def calculate_utility(self, store: Restaurant, customer: Customer, current_hour: float) -> float:
         """
         Calculate utility using additive model (proper MNL).
         Utility = sum of attribute values × coefficients
         Segment-specific multipliers adjust weights based on customer type.
+        Price elasticity modeling: demand response to price changes varies by segment.
+        Cached for performance when same store/customer combination is evaluated multiple times.
         """
+        # use cache key (store and customer don't change frequently during a single decision)
+        cache_key = (id(store), id(customer))
+        if cache_key in self._utility_cache:
+            return self._utility_cache[cache_key]
+        
         utility = self.params['base_utility']
         
         # get customer segment and multipliers
         segment = customer.customer_segment
         multipliers = SEGMENT_MULTIPLIERS.get(segment, SEGMENT_MULTIPLIERS['BALANCED'])
+        elasticity = PRICE_ELASTICITY.get(segment, PRICE_ELASTICITY['BALANCED'])
         
-        # price (continuous, negative coefficient) - adjusted by segment
-        price_component = self.params['price_sensitivity'] * (store.price / 10.0)
+        # price (continuous, negative coefficient) - adjusted by segment and elasticity
+        # use reference price (customer's max_price) for elasticity calculation
+        reference_price = customer.preferences.get('max_price', 25.0)
+        effective_price = store.get_effective_price() if hasattr(store, 'get_effective_price') else store.price
+        price_ratio = effective_price / reference_price if reference_price > 0 else 1.0
+        
+        # apply price elasticity: more elastic segments respond more strongly to price changes
+        # elasticity effect: (price_ratio - 1) * elasticity
+        # e.g., if price is 20% above reference and elasticity is -2.0, utility decreases by 40%
+        price_elasticity_effect = (price_ratio - 1.0) * abs(elasticity)
+        price_component = self.params['price_sensitivity'] * (effective_price / 10.0) * (1.0 + price_elasticity_effect)
         utility += price_component * multipliers['price']
+        
+        # promotion boost: customers respond positively to active promotions
+        if hasattr(store, 'active_promotion') and store.active_promotion:
+            promotion_boost = 0.3 * (store.active_promotion.get('discount_pct', 0) / 100.0)
+            utility += promotion_boost  # boost utility for promotions
+        
+        # network effects: social proof from other customers
+        # high-rated stores with recent orders get boost (word-of-mouth effect)
+        if hasattr(store, 'recent_orders_count') and store.recent_orders_count > 0:
+            # social proof: more recent orders = more popular = higher utility
+            social_proof_boost = 0.15 * min(1.0, store.recent_orders_count / 10.0)
+            utility += social_proof_boost
+        
+        # social influence: if store is popular in marketplace, boost utility
+        # this simulates word-of-mouth and social proof
+        if hasattr(customer, 'social_influence_score') and store.restaurant_id in customer.social_influence_score:
+            influence_boost = customer.social_influence_score[store.restaurant_id] * 0.2
+            utility += influence_boost
         
         # rating (continuous, positive coefficient) - adjusted by segment
         rating_component = self.params['rating_importance'] * (store.rating / 5.0)
@@ -320,7 +462,13 @@ class CustomerChoiceMNL:
             safe_capacity = store.est_inventory - store.reservation_count
             utility += 0.2 * min(1.0, safe_capacity / 10.0)
         
+        # cache result
+        self._utility_cache[cache_key] = utility
         return utility
+    
+    def clear_cache(self):
+        """clear utility cache (call when stores/customers change)"""
+        self._utility_cache.clear()
     
     def make_choice(self, displayed_stores: List[Restaurant], customer: Customer, current_hour: float) -> Optional[Restaurant]:
         """
