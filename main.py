@@ -31,6 +31,8 @@ if __name__ == "__main__":
                         help="Target number of stores (if CSV provided, will generate additional if needed)")
     parser.add_argument("--customers", type=int, default=None,
                         help="Target number of customers (if CSV provided, will generate additional if needed)")
+    parser.add_argument("--skip-anan", action="store_true", dest="skip_anan",
+                        help="Skip Anan's strategy (collaborative filtering is slow for large datasets)")
     args = parser.parse_args()
 
     # Determine files to use based on args
@@ -92,7 +94,8 @@ if __name__ == "__main__":
             verbose=True,
             seed=None,
             output_dir="simulation_results",
-            num_days=args.days
+            num_days=args.days,
+            skip_anan=args.skip_anan
         )
     else:
         print(f"CSV files not found: {stores_file}, {customers_file}")
@@ -107,5 +110,6 @@ if __name__ == "__main__":
             verbose=True,
             seed=None,
             output_dir="simulation_results",
-            num_days=args.days
+            num_days=args.days,
+            skip_anan=args.skip_anan
         )

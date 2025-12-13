@@ -518,19 +518,49 @@ def end_of_day_processing_enhanced(marketplace: Optional["Marketplace"] = None, 
             actual = int(store.est_inventory * factor)
             store.actual_inventory = max(0, actual)
         
-        # calculate cancellations
-        cancellations = max(0, store.reservation_count - store.actual_inventory)
+        # calculate cancellations with bag doubling logic
+        # if actual > estimated, restaurant can double bag capacity
+        if store.actual_inventory > store.est_inventory:
+            doubled_capacity = 2 * store.est_inventory
+            max_fulfillable = min(store.reservation_count, doubled_capacity)
+            cancellations = max(0, store.reservation_count - max_fulfillable)
+        else:
+            # normal case: cancellations occur when reservations > actual inventory
+            cancellations = max(0, store.reservation_count - store.actual_inventory)
+        
         store.cancellation_count = cancellations
         total_cancellations += cancellations
         
-        # calculate actual sales
-        actual_sales = min(store.reservation_count, store.actual_inventory)
+        # calculate actual sales with bag doubling logic
+        # if actual inventory > estimated, restaurant can double bag quantity
+        if store.actual_inventory > store.est_inventory:
+            # restaurant can double the bag capacity (2x estimated inventory)
+            doubled_capacity = 2 * store.est_inventory
+            # can fulfill up to doubled capacity or reservation count, whichever is smaller
+            max_fulfillable = min(store.reservation_count, doubled_capacity)
+            actual_sales = min(max_fulfillable, store.actual_inventory)
+        else:
+            # normal case: actual <= estimated
+            actual_sales = min(store.reservation_count, store.actual_inventory)
+        
         store.completed_order_count = actual_sales
         total_completed += actual_sales
         total_customers_who_bought += actual_sales
         
-        # calculate waste
-        waste_units = max(0, store.actual_inventory - store.reservation_count)
+        # calculate waste with bag doubling logic
+        # if actual > estimated, restaurant can double bag capacity
+        if store.actual_inventory > store.est_inventory:
+            # doubled capacity = 2 * estimated inventory
+            doubled_capacity = 2 * store.est_inventory
+            # maximum that can be used (fulfilled orders)
+            max_used = min(store.reservation_count, doubled_capacity, store.actual_inventory)
+            # waste = anything left after using up to doubled capacity
+            waste_units = max(0, store.actual_inventory - max_used)
+        else:
+            # normal case: waste = actual - reservations (if positive)
+            waste_units = max(0, store.actual_inventory - store.reservation_count)
+        
+        # waste cost = full selling price
         waste_monetary = waste_units * store.price
         total_waste_units += waste_units
         total_waste_monetary += waste_monetary
@@ -603,6 +633,8 @@ def end_of_day_processing_enhanced(marketplace: Optional["Marketplace"] = None, 
     orders_per_customer = total_completed / total_customers if total_customers > 0 else 0.0
     
     # ===== CUSTOMER EXPERIENCE METRICS =====
+    # net revenue = revenue - waste cost (full price) - cancellation cost (lost revenue)
+    # note: cancellation_cost represents lost revenue opportunity, not actual cost
     net_revenue = total_revenue - total_waste_monetary - total_cancellation_cost
     avg_cancellation_cost = total_cancellation_cost / total_cancellations if total_cancellations > 0 else 0.0
     cancellation_impact_ratio = total_cancellation_cost / total_revenue if total_revenue > 0 else 0.0
@@ -625,6 +657,7 @@ def end_of_day_processing_enhanced(marketplace: Optional["Marketplace"] = None, 
         # basic metrics (same as original)
         'total_cancellations': total_cancellations,
         'total_waste': total_waste_units,
+        'total_waste_bags': total_waste_units,  # explicit count of waste bags
         'total_waste_monetary': total_waste_monetary,
         'total_revenue': total_revenue,
         'total_completed_orders': total_completed,
@@ -757,6 +790,7 @@ def end_of_day_processing(marketplace, debug: bool = False) -> Dict:
             # Normal case: waste = actual - reservations (if positive)
             waste_units = max(0, store.actual_inventory - store.reservation_count)
         
+        # waste cost = full selling price
         waste_monetary = waste_units * store.price
         total_waste_units += waste_units
         total_waste_monetary += waste_monetary
@@ -789,6 +823,7 @@ def end_of_day_processing(marketplace, debug: bool = False) -> Dict:
     return {
         'total_cancellations': total_cancellations,
         'total_waste': total_waste_units,
+        'total_waste_bags': total_waste_units,  # explicit count of waste bags
         'total_waste_monetary': total_waste_monetary,
         'total_revenue': total_revenue,
         'total_completed_orders': total_completed,

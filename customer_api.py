@@ -66,10 +66,13 @@ class Customer:
         # network effects tracking
         self.social_influence_score = {}  # {store_id: influence_score} - influenced by other customers
         
-        # churn tracking
+        # churn tracking (dynamic with running averages)
         self.consecutive_cancellations = 0
         self.is_churned = False
         self.days_since_churn = 0
+        self.cancellation_history = []  # list of (day, was_cancelled: bool) for running average
+        self.cancellation_rate_window = 7  # days to look back for running average
+        self.running_cancellation_rate = 0.0  # running average cancellation rate
         
         # customer lifetime value (CLV) tracking
         self.total_orders = 0

@@ -279,8 +279,10 @@ def simulate_customer_arrival(marketplace: Marketplace, customer: Customer, skip
         # find store in marketplace.stores and update it directly
         store = next((s for s in all_stores if s.restaurant_id == decision['store_id']), None)
         if store:
+            # reserve the order (may fail if store is at capacity)
+            # note: revenue is calculated at end of day based on actual completed orders
+            # we don't track revenue here since orders can be cancelled
             store.reserve_order()
-            marketplace.total_revenue += store.price
 
     # add customer to marketplace
     marketplace.customers.append(customer)
@@ -570,12 +572,20 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             if decision['action'] == 'buy':
                 customer_orders_today[customer.customer_id] = decision['store_id']
                 # track peak vs off-peak reservations for supply-demand balance KPI
+                # IMPORTANT: only count if reservation actually succeeded (store.reservation_count was incremented)
                 store_id = decision['store_id']
-                is_peak = is_peak_hour(customer.arrival_time)
-                if is_peak:
-                    peak_reservations[store_id] = peak_reservations.get(store_id, 0) + 1
-                else:
-                    offpeak_reservations[store_id] = offpeak_reservations.get(store_id, 0) + 1
+                store = next((s for s in stores_copy if s.restaurant_id == store_id), None)
+                if store:
+                    # check if reservation was actually made (reservation_count matches what we expect)
+                    # we track peak/offpeak when customer buys, but reservation might fail if at capacity
+                    # so we need to verify the reservation actually happened
+                    # since reserve_order() is called in simulate_customer_arrival, we track here
+                    # but we should verify it matches store.reservation_count at end of day
+                    is_peak = is_peak_hour(customer.arrival_time)
+                    if is_peak:
+                        peak_reservations[store_id] = peak_reservations.get(store_id, 0) + 1
+                    else:
+                        offpeak_reservations[store_id] = offpeak_reservations.get(store_id, 0) + 1
                 
                 # track segment-specific metrics
                 segment = customer.customer_segment
@@ -644,27 +654,74 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         
         # calculate peak/off-peak completed and cancelled based on store results
         # and customer arrival times
+        # IMPORTANT: verify that peak_res + offpeak_res matches store.reservation_count
+        # if not, there's a mismatch (reservations were rejected due to capacity)
         for store in stores_copy:
             store_id = store.restaurant_id
             peak_res = peak_reservations.get(store_id, 0)
             offpeak_res = offpeak_reservations.get(store_id, 0)
             total_res = peak_res + offpeak_res
             
+            # verify reservation count matches (with tolerance for rounding)
+            # if store.reservation_count doesn't match, adjust peak/offpeak proportionally
+            if total_res > 0 and abs(store.reservation_count - total_res) > 0.01:
+                # mismatch detected - scale peak/offpeak to match actual reservation_count
+                scale_factor = store.reservation_count / total_res if total_res > 0 else 1.0
+                peak_res = int(round(peak_res * scale_factor))
+                offpeak_res = store.reservation_count - peak_res
+                # update the dictionaries
+                peak_reservations[store_id] = peak_res
+                offpeak_reservations[store_id] = offpeak_res
+                total_res = peak_res + offpeak_res
+            
+            # calculate per-store waste using the same logic as end_of_day_processing_enhanced
+            # this must match exactly to ensure consistency
+            if store.actual_inventory > store.est_inventory:
+                # bag doubling case: can use up to 2x est_inventory
+                doubled_capacity = 2 * store.est_inventory
+                max_used = min(store.reservation_count, doubled_capacity, store.actual_inventory)
+                store_waste = max(0, store.actual_inventory - max_used)
+            else:
+                # normal case: waste = actual - reservations (if positive)
+                store_waste = max(0, store.actual_inventory - store.reservation_count)
+            
             if total_res > 0:
                 # proportionally allocate completed/cancelled to peak vs off-peak
                 # ensure we don't allocate more than actual reservations
                 peak_ratio = peak_res / total_res if total_res > 0 else 0
-                # cap allocations to not exceed reservations
-                peak_completed[store_id] = min(int(store.completed_order_count * peak_ratio), peak_res)
-                peak_cancellations[store_id] = min(int(store.cancellation_count * peak_ratio), peak_res)
-                # ensure off-peak doesn't exceed off-peak reservations
-                offpeak_completed[store_id] = min(store.completed_order_count - peak_completed[store_id], offpeak_res)
-                offpeak_cancellations[store_id] = min(store.cancellation_count - peak_cancellations[store_id], offpeak_res)
                 
-                # waste is allocated based on when inventory was available
-                # for simplicity, allocate proportionally (could be improved)
-                peak_waste[store_id] = int(day_results.get('total_waste', 0) * peak_ratio / len(stores_copy))
-                offpeak_waste[store_id] = (day_results.get('total_waste', 0) / len(stores_copy)) - peak_waste[store_id]
+                # allocate completed orders proportionally, ensuring peak + off-peak = total
+                # use rounding instead of int() to minimize rounding errors
+                peak_completed_raw = store.completed_order_count * peak_ratio
+                peak_completed[store_id] = min(int(round(peak_completed_raw)), peak_res, store.completed_order_count)
+                offpeak_completed[store_id] = store.completed_order_count - peak_completed[store_id]
+                # ensure off-peak doesn't exceed off-peak reservations
+                offpeak_completed[store_id] = min(offpeak_completed[store_id], offpeak_res)
+                # adjust peak if needed to ensure total is correct
+                if peak_completed[store_id] + offpeak_completed[store_id] != store.completed_order_count:
+                    peak_completed[store_id] = store.completed_order_count - offpeak_completed[store_id]
+                    peak_completed[store_id] = min(peak_completed[store_id], peak_res)
+                
+                # allocate cancellations proportionally, ensuring peak + off-peak = total
+                peak_cancellations_raw = store.cancellation_count * peak_ratio
+                peak_cancellations[store_id] = min(int(round(peak_cancellations_raw)), peak_res, store.cancellation_count)
+                offpeak_cancellations[store_id] = store.cancellation_count - peak_cancellations[store_id]
+                # ensure off-peak doesn't exceed off-peak reservations
+                offpeak_cancellations[store_id] = min(offpeak_cancellations[store_id], offpeak_res)
+                # adjust peak if needed to ensure total is correct
+                if peak_cancellations[store_id] + offpeak_cancellations[store_id] != store.cancellation_count:
+                    peak_cancellations[store_id] = store.cancellation_count - offpeak_cancellations[store_id]
+                    peak_cancellations[store_id] = min(peak_cancellations[store_id], peak_res)
+            else:
+                # store has no reservations - all completed/cancelled go to off-peak
+                peak_completed[store_id] = 0
+                peak_cancellations[store_id] = 0
+                offpeak_completed[store_id] = store.completed_order_count
+                offpeak_cancellations[store_id] = store.cancellation_count
+                
+                # store has no reservations - all waste goes to off-peak (no peak activity)
+                peak_waste[store_id] = 0
+                offpeak_waste[store_id] = store_waste
         
         peak_total_completed = sum(peak_completed.values())
         peak_total_cancellations = sum(peak_cancellations.values())
@@ -672,6 +729,46 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         offpeak_total_completed = sum(offpeak_completed.values())
         offpeak_total_cancellations = sum(offpeak_cancellations.values())
         offpeak_total_waste = sum(offpeak_waste.values())
+        
+        # verification: peak + off-peak should equal total
+        total_completed_from_stores = sum(s.completed_order_count for s in stores_copy)
+        total_cancellations_from_stores = sum(s.cancellation_count for s in stores_copy)
+        total_reservations_from_stores = sum(s.reservation_count for s in stores_copy)
+        
+        # verify consistency (allow small rounding differences)
+        if abs((peak_total_completed + offpeak_total_completed) - total_completed_from_stores) > 1:
+            # adjust to match - distribute difference proportionally
+            diff = total_completed_from_stores - (peak_total_completed + offpeak_total_completed)
+            if peak_total_reservations + offpeak_total_reservations > 0:
+                peak_adj = int(round(diff * peak_total_reservations / (peak_total_reservations + offpeak_total_reservations)))
+                offpeak_adj = diff - peak_adj
+                # apply adjustment to the store with most reservations in each category
+                if peak_adj != 0 and peak_total_reservations > 0:
+                    max_peak_store = max(peak_reservations.items(), key=lambda x: x[1])[0]
+                    peak_completed[max_peak_store] = peak_completed.get(max_peak_store, 0) + peak_adj
+                if offpeak_adj != 0 and offpeak_total_reservations > 0:
+                    max_offpeak_store = max(offpeak_reservations.items(), key=lambda x: x[1])[0]
+                    offpeak_completed[max_offpeak_store] = offpeak_completed.get(max_offpeak_store, 0) + offpeak_adj
+                # recalculate totals
+                peak_total_completed = sum(peak_completed.values())
+                offpeak_total_completed = sum(offpeak_completed.values())
+        
+        if abs((peak_total_cancellations + offpeak_total_cancellations) - total_cancellations_from_stores) > 1:
+            # adjust to match - distribute difference proportionally
+            diff = total_cancellations_from_stores - (peak_total_cancellations + offpeak_total_cancellations)
+            if peak_total_reservations + offpeak_total_reservations > 0:
+                peak_adj = int(round(diff * peak_total_reservations / (peak_total_reservations + offpeak_total_reservations)))
+                offpeak_adj = diff - peak_adj
+                # apply adjustment
+                if peak_adj != 0 and peak_total_reservations > 0:
+                    max_peak_store = max(peak_reservations.items(), key=lambda x: x[1])[0]
+                    peak_cancellations[max_peak_store] = peak_cancellations.get(max_peak_store, 0) + peak_adj
+                if offpeak_adj != 0 and offpeak_total_reservations > 0:
+                    max_offpeak_store = max(offpeak_reservations.items(), key=lambda x: x[1])[0]
+                    offpeak_cancellations[max_offpeak_store] = offpeak_cancellations.get(max_offpeak_store, 0) + offpeak_adj
+                # recalculate totals
+                peak_total_cancellations = sum(peak_cancellations.values())
+                offpeak_total_cancellations = sum(offpeak_cancellations.values())
         
         # calculate peak supply-demand balance metrics
         # cap fulfillment rate at 100% (can't fulfill more than reservations)
@@ -681,8 +778,12 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         
         # calculate peak supply-demand ratio (how well supply matched demand)
         # this measures how much demand (reservations) relative to available supply during peaks
-        # we approximate by using est_inventory as the supply available
-        peak_total_supply = sum(s.est_inventory for s in stores_copy)
+        # account for bag doubling: if actual > est, supply can be up to 2x est_inventory
+        peak_total_supply = 0
+        for s in stores_copy:
+            # maximum supply = max(actual_inventory, 2 * est_inventory) for bag doubling
+            max_supply = max(s.actual_inventory, 2 * s.est_inventory) if s.actual_inventory > s.est_inventory else s.est_inventory
+            peak_total_supply += max_supply
         peak_supply_demand_ratio = (peak_total_reservations / peak_total_supply) if peak_total_supply > 0 else 0.0
         
         # off-peak metrics for comparison
@@ -727,30 +828,75 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         # find customers who successfully completed orders vs got cancelled
         customer_id_to_obj = {c.customer_id: c for c in customers_copy}
         
+        # track customer waste (negative impact from cancellations)
+        total_customer_waste = 0.0  # aggregate negative impact on customers
+        
+        # calculate daily churn rate (before updating customer states)
+        churned_customers_today = sum(1 for c in customers_copy if c.is_churned)
+        total_customers_today = len(customers_copy)
+        daily_churn_rate = (churned_customers_today / total_customers_today * 100) if total_customers_today > 0 else 0.0
+        
         for activity in customer_daily_activities:
             if activity['day'] == day and activity['action'] == 'buy':
                 customer_id = activity['customer_id']
                 customer = customer_id_to_obj.get(customer_id)
                 if customer:
-                    if activity['cancelled']:
-                        # order was cancelled - decrease satisfaction and track churn
-                        customer.satisfaction_level = max(0.0, customer.satisfaction_level - 0.15)
+                    # record cancellation history for running average
+                    was_cancelled = activity.get('cancelled', False)
+                    customer.cancellation_history.append((day, was_cancelled))
+                    
+                    # keep only recent history (last cancellation_rate_window days)
+                    customer.cancellation_history = [
+                        (d, c) for d, c in customer.cancellation_history 
+                        if day - d <= customer.cancellation_rate_window
+                    ]
+                    
+                    # calculate running average cancellation rate
+                    if len(customer.cancellation_history) > 0:
+                        recent_cancellations = sum(1 for _, c in customer.cancellation_history if c)
+                        recent_orders = len(customer.cancellation_history)
+                        customer.running_cancellation_rate = recent_cancellations / recent_orders if recent_orders > 0 else 0.0
+                    else:
+                        customer.running_cancellation_rate = 0.0
+                    
+                    if was_cancelled:
+                        # dynamic satisfaction decrease: proportional to running cancellation rate
+                        # base decrease: 0.10, scales up to 0.25 for high cancellation rates
+                        base_decrease = 0.10
+                        rate_multiplier = 1.0 + (customer.running_cancellation_rate * 1.5)  # 1.0x to 2.5x
+                        satisfaction_decrease = base_decrease * rate_multiplier
+                        customer.satisfaction_level = max(0.0, customer.satisfaction_level - satisfaction_decrease)
                         customer.consecutive_cancellations += 1
                         
-                        # churn logic: 2+ consecutive cancellations increases churn risk
-                        if customer.consecutive_cancellations >= 2:
+                        # dynamic churn logic: based on running average cancellation rate
+                        # churn threshold: 40% cancellation rate over window (instead of fixed 2+ consecutive)
+                        churn_threshold = 0.40  # 40% cancellation rate triggers churn
+                        if customer.running_cancellation_rate >= churn_threshold:
                             customer.is_churned = True
                             customer.days_since_churn = 0
+                        
+                        # customer waste: negative impact = satisfaction loss + churn risk
+                        # weight satisfaction loss by current satisfaction (higher satisfaction = more waste)
+                        satisfaction_waste = satisfaction_decrease * customer.satisfaction_level
+                        churn_waste = 0.5 if customer.is_churned else (customer.running_cancellation_rate * 0.3)
+                        customer_waste_today = satisfaction_waste + churn_waste
+                        total_customer_waste += customer_waste_today
                     else:
-                        # order completed successfully - increase satisfaction and reset cancellation streak
-                        customer.satisfaction_level = min(1.0, customer.satisfaction_level + 0.05)
+                        # order completed successfully - dynamic satisfaction increase
+                        # increase is proportional to how low current satisfaction is (diminishing returns)
+                        base_increase = 0.05
+                        recovery_multiplier = 1.0 + (1.0 - customer.satisfaction_level) * 0.5  # more recovery if low satisfaction
+                        satisfaction_increase = base_increase * recovery_multiplier
+                        customer.satisfaction_level = min(1.0, customer.satisfaction_level + satisfaction_increase)
                         customer.consecutive_cancellations = 0
                         
                         # win-back: if customer was churned but completed order, reduce churn
                         if customer.is_churned:
                             customer.days_since_churn += 1
-                            if customer.days_since_churn >= 7:
-                                # win-back after 7 days of good behavior
+                            # dynamic win-back: faster recovery if cancellation rate drops
+                            winback_days_needed = max(3, int(7 * (1.0 - customer.running_cancellation_rate)))
+                            if customer.days_since_churn >= winback_days_needed:
+                                # win-back after good behavior period
                                 customer.is_churned = False
                                 customer.days_since_churn = 0
         
@@ -762,6 +908,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             'total_cancellations': day_results['total_cancellations'],
             'total_revenue': day_results['total_revenue'],
             'total_waste': day_results['total_waste'],
+            'total_waste_bags': day_results.get('total_waste_bags', day_results.get('total_waste', 0)),  # explicit count of waste bags
             'total_waste_monetary': day_results.get('total_waste_monetary', 0.0),
             'customer_satisfaction': day_results.get('customer_satisfaction', 0.0),
             'conversion_rate': day_results.get('conversion_rate', 0.0),
@@ -769,6 +916,21 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             'profit_margin': day_results.get('profit_margin_proxy', 0.0),
             'revenue_per_customer': day_results.get('revenue_per_customer', 0.0),
             'avg_store_accuracy': day_results.get('avg_store_accuracy', 0.0),
+            # efficiency metrics (from end_of_day_processing_enhanced)
+            'revenue_per_waste_unit': day_results.get('revenue_per_waste_unit', 0.0),
+            'waste_efficiency_ratio': day_results.get('waste_efficiency_ratio', 0.0),
+            'orders_per_customer': day_results.get('orders_per_customer', 0.0),
+            'inventory_turnover': day_results.get('inventory_turnover', 0.0),
+            'revenue_per_inventory_unit': day_results.get('revenue_per_inventory_unit', 0.0),
+            # business health metrics
+            'net_revenue': day_results.get('net_revenue', 0.0),
+            'cancellation_cost': day_results.get('cancellation_cost', 0.0),
+            'cancellation_impact_ratio': day_results.get('cancellation_impact_ratio', 0.0),
+            'avg_cancellation_cost': day_results.get('avg_cancellation_cost', 0.0),
+            # inventory accuracy metrics
+            'accuracy_weighted_waste': day_results.get('accuracy_weighted_waste', 0.0),
+            'accuracy_weighted_cancellations': day_results.get('accuracy_weighted_cancellations', 0.0),
+            'stores_poor_accuracy': day_results.get('stores_poor_accuracy', 0),
             # peak supply-demand balance metrics
             'peak_fulfillment_rate': peak_fulfillment_rate,
             'peak_cancellation_rate': peak_cancellation_rate,
@@ -794,8 +956,58 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
             'market_concentration_hhi': hhi,
             'leader_stores': leader_count,
             'follower_stores': follower_count,
-            'avg_market_share': avg_market_share_day
+            'avg_market_share': avg_market_share_day,
+            # customer waste: negative impact on customers from cancellations
+            'customer_waste': total_customer_waste,
+            'avg_customer_waste': total_customer_waste / len(customers_copy) if customers_copy else 0.0,
+            # churn metrics (daily)
+            'churn_rate': daily_churn_rate,
+            'churned_customers': churned_customers_today
         }
+        
+        # calculate fairness metrics (Gini coefficients) for store exposure and revenue
+        from restaurant_api import calculate_gini_coefficient
+        store_exposures_today = [s.exposure_count for s in stores_copy]
+        store_revenues_today = [s.completed_order_count * s.price for s in stores_copy]
+        exposure_gini = calculate_gini_coefficient(store_exposures_today) if store_exposures_today else 0.0
+        revenue_gini = calculate_gini_coefficient(store_revenues_today) if store_revenues_today else 0.0
+        
+        # calculate customer behavior metrics
+        customers_who_bought_today = [c for c in customers_copy if any(
+            a['day'] == day and a['action'] == 'buy' and not a.get('cancelled', False)
+            for a in customer_daily_activities if a['customer_id'] == c.customer_id
+        )]
+        repeat_customers = sum(1 for c in customers_who_bought_today if c.total_orders > 1)
+        repeat_purchase_rate = (repeat_customers / len(customers_who_bought_today) * 100) if customers_who_bought_today else 0.0
+        
+        # average stores viewed per customer (browsing behavior)
+        stores_viewed_counts = [len(c.displayed_stores) for c in customers_copy if c.displayed_stores]
+        avg_stores_viewed = np.mean(stores_viewed_counts) if stores_viewed_counts else 0.0
+        
+        # bounce rate: customers who viewed but didn't buy
+        customers_viewed = sum(1 for c in customers_copy if c.displayed_stores)
+        customers_bought = len(customers_who_bought_today)
+        bounce_rate = ((customers_viewed - customers_bought) / customers_viewed * 100) if customers_viewed > 0 else 0.0
+        
+        # store health metrics
+        stores_zero_orders = sum(1 for s in stores_copy if s.completed_order_count == 0)
+        bag_doubling_used = sum(1 for s in stores_copy if s.actual_inventory > s.est_inventory)
+        bag_doubling_utilization = (bag_doubling_used / len(stores_copy) * 100) if stores_copy else 0.0
+        
+        # add fairness and additional metrics to daily KPIs
+        daily_kpis.update({
+            # fairness metrics
+            'exposure_gini': exposure_gini,
+            'revenue_gini': revenue_gini,
+            # customer behavior metrics
+            'repeat_purchase_rate': repeat_purchase_rate,
+            'avg_stores_viewed': avg_stores_viewed,
+            'bounce_rate': bounce_rate,
+            # store health metrics
+            'stores_zero_orders': stores_zero_orders,
+            'bag_doubling_utilization': bag_doubling_utilization
+        })
+        
         daily_kpis_list.append(daily_kpis)
     
     # Restore original select_stores
@@ -849,6 +1061,7 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'avg_total_cancellations': np.mean([k['total_cancellations'] for k in daily_kpis_list]),
         'avg_total_revenue': np.mean([k['total_revenue'] for k in daily_kpis_list]),
         'avg_total_waste': np.mean([k['total_waste'] for k in daily_kpis_list]),
+        'avg_total_waste_bags': np.mean([k.get('total_waste_bags', k.get('total_waste', 0)) for k in daily_kpis_list]),  # explicit count of waste bags
         'avg_total_waste_monetary': np.mean([k['total_waste_monetary'] for k in daily_kpis_list]),
         'avg_customer_satisfaction': np.mean([k['customer_satisfaction'] for k in daily_kpis_list]),
         'avg_conversion_rate': np.mean([k.get('conversion_rate', 0.0) for k in daily_kpis_list]),
@@ -885,6 +1098,34 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'churned_customers': churned_customers,
         'new_customers': new_customers,
         'avg_customer_lifespan': avg_customer_lifespan,
+        # customer waste metrics (averaged across days)
+        'avg_customer_waste': np.mean([k.get('customer_waste', 0.0) for k in daily_kpis_list]),
+        'avg_customer_waste_per_customer': np.mean([k.get('avg_customer_waste', 0.0) for k in daily_kpis_list]),
+        # efficiency metrics (averaged across days)
+        'avg_revenue_per_waste_unit': np.mean([k.get('revenue_per_waste_unit', 0.0) for k in daily_kpis_list]),
+        'avg_waste_efficiency_ratio': np.mean([k.get('waste_efficiency_ratio', 0.0) for k in daily_kpis_list]),
+        'avg_orders_per_customer': np.mean([k.get('orders_per_customer', 0.0) for k in daily_kpis_list]),
+        'avg_inventory_turnover': np.mean([k.get('inventory_turnover', 0.0) for k in daily_kpis_list]),
+        'avg_revenue_per_inventory_unit': np.mean([k.get('revenue_per_inventory_unit', 0.0) for k in daily_kpis_list]),
+        # business health metrics (averaged across days)
+        'avg_net_revenue': np.mean([k.get('net_revenue', 0.0) for k in daily_kpis_list]),
+        'avg_cancellation_cost': np.mean([k.get('cancellation_cost', 0.0) for k in daily_kpis_list]),
+        'avg_cancellation_impact_ratio': np.mean([k.get('cancellation_impact_ratio', 0.0) for k in daily_kpis_list]),
+        'avg_avg_cancellation_cost': np.mean([k.get('avg_cancellation_cost', 0.0) for k in daily_kpis_list]),
+        # inventory accuracy metrics (averaged across days)
+        'avg_accuracy_weighted_waste': np.mean([k.get('accuracy_weighted_waste', 0.0) for k in daily_kpis_list]),
+        'avg_accuracy_weighted_cancellations': np.mean([k.get('accuracy_weighted_cancellations', 0.0) for k in daily_kpis_list]),
+        'avg_stores_poor_accuracy': np.mean([k.get('stores_poor_accuracy', 0) for k in daily_kpis_list]),
+        # fairness metrics (averaged across days)
+        'avg_exposure_gini': np.mean([k.get('exposure_gini', 0.0) for k in daily_kpis_list]),
+        'avg_revenue_gini': np.mean([k.get('revenue_gini', 0.0) for k in daily_kpis_list]),
+        # customer behavior metrics (averaged across days)
+        'avg_repeat_purchase_rate': np.mean([k.get('repeat_purchase_rate', 0.0) for k in daily_kpis_list]),
+        'avg_stores_viewed': np.mean([k.get('avg_stores_viewed', 0.0) for k in daily_kpis_list]),
+        'avg_bounce_rate': np.mean([k.get('bounce_rate', 0.0) for k in daily_kpis_list]),
+        # store health metrics (averaged across days)
+        'avg_stores_zero_orders': np.mean([k.get('stores_zero_orders', 0) for k in daily_kpis_list]),
+        'avg_bag_doubling_utilization': np.mean([k.get('bag_doubling_utilization', 0.0) for k in daily_kpis_list]),
         'total_days': num_days
     }
     
@@ -899,7 +1140,8 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
 def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Optional[int] = None,
                       duration: float = 24.0, verbose: bool = True, seed: Optional[int] = None,
                       stores_csv: Optional[str] = None, customers_csv: Optional[str] = None,
-                      output_dir: str = "simulation_results", num_days: int = 10) -> Dict:
+                      output_dir: str = "simulation_results", num_days: int = 10, 
+                      skip_anan: bool = False) -> Dict:
     """
     Run multi-day simulation with Greedy (baseline) and Near-Optimal strategies and compare KPIs.
     
@@ -1066,12 +1308,18 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         )
     
     # anan strategy needs original customers/stores (not parallelizable easily)
-    if verbose:
-        print("\nRunning Anan Strategy (New)...")
-    anan_strategy = Anan_Strategy(customers, stores)
-    anan_results = run_single_strategy_simulation(
-        anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
-    )
+    # skip if requested (collaborative filtering is slow for large datasets)
+    if skip_anan:
+        if verbose:
+            print("\nSkipping Anan Strategy (collaborative filtering is slow for large datasets)...")
+        anan_results = None
+    else:
+        if verbose:
+            print("\nRunning Anan Strategy (New)...")
+        anan_strategy = Anan_Strategy(customers, stores)
+        anan_results = run_single_strategy_simulation(
+            anan_strategy, "Anan_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+        )
     
     # Calculate metrics for comparison
     def calc_metrics(results):
@@ -1081,7 +1329,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             kpis['avg_total_completed_orders'],
             kpis['avg_total_cancellations'],
             kpis['avg_total_revenue'],
-            kpis['avg_total_waste'],
+            kpis.get('avg_total_waste_bags', kpis.get('avg_total_waste', 0)),  # explicit count of waste bags
             (kpis['avg_total_completed_orders'] / (kpis['avg_total_completed_orders'] + kpis['avg_total_cancellations']) * 100) if (kpis['avg_total_completed_orders'] + kpis['avg_total_cancellations']) > 0 else 0,
             (kpis['avg_total_cancellations'] / (kpis['avg_total_completed_orders'] + kpis['avg_total_cancellations']) * 100) if (kpis['avg_total_completed_orders'] + kpis['avg_total_cancellations']) > 0 else 0,
             # Enhanced Metrics
@@ -1092,7 +1340,24 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             kpis.get('avg_peak_fulfillment_rate', 0.0),
             kpis.get('avg_peak_cancellation_rate', 0.0),
             kpis.get('avg_peak_supply_demand_ratio', 0.0),
-            kpis.get('avg_offpeak_fulfillment_rate', 0.0)
+            kpis.get('avg_offpeak_fulfillment_rate', 0.0),
+            # Customer Waste Metric
+            kpis.get('avg_customer_waste_per_customer', 0.0),
+            # Churn Rate
+            kpis.get('churn_rate', 0.0),
+            # Efficiency Metrics
+            kpis.get('avg_revenue_per_waste_unit', 0.0),
+            kpis.get('avg_inventory_turnover', 0.0),
+            # Business Health Metrics
+            kpis.get('avg_net_revenue', 0.0),
+            kpis.get('avg_cancellation_impact_ratio', 0.0),
+            # Fairness Metrics
+            kpis.get('avg_exposure_gini', 0.0),
+            # Customer Behavior Metrics
+            kpis.get('avg_repeat_purchase_rate', 0.0),
+            kpis.get('avg_bounce_rate', 0.0),
+            # Store Health Metrics
+            kpis.get('avg_stores_zero_orders', 0.0)
         ]
     
     comparison = {
@@ -1101,7 +1366,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             'Average Completed Orders per Day',
             'Average Cancellations per Day (raw count)',
             'Average Revenue per Day',
-            'Average Waste (units) per Day',
+            'Average Waste Bags per Day',
             'Fulfillment Rate (%)',
             'Cancellation Rate (%)',
             'Profit Margin (%)',
@@ -1110,14 +1375,27 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             'Peak Fulfillment Rate (%)',
             'Peak Cancellation Rate (%)',
             'Peak Supply-Demand Ratio',
-            'Off-Peak Fulfillment Rate (%)'
+            'Off-Peak Fulfillment Rate (%)',
+            'Customer Waste (per customer)',
+            'Churn Rate (%)',
+            'Revenue per Waste Unit',
+            'Inventory Turnover',
+            'Net Revenue',
+            'Cancellation Impact Ratio (%)',
+            'Exposure Gini (fairness)',
+            'Repeat Purchase Rate (%)',
+            'Bounce Rate (%)',
+            'Stores with Zero Orders'
         ],
         'greedy': calc_metrics(greedy_results),
         'near_optimal': calc_metrics(near_optimal_results),
         'rwes_t': calc_metrics(rwes_t_results),
-        'anan': calc_metrics(anan_results),
         'yomna': calc_metrics(yomna_results)
     }
+    
+    # add anan results only if not skipped
+    if anan_results is not None:
+        comparison['anan'] = calc_metrics(anan_results)
     
     # Create output directory
     if not os.path.exists(output_dir):
@@ -1129,10 +1407,16 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     comparison_df.to_csv(comparison_file, index=False)
     
     # Save individual strategy KPIs
-    for name, res in [('greedy', greedy_results), ('near_optimal', near_optimal_results), 
-                      ('rwes_t', rwes_t_results), ('anan', anan_results), ('yomna', yomna_results)]:
-        df = pd.DataFrame([res['average_kpis']])
-        df.to_csv(os.path.join(output_dir, f"{name}_strategy_kpis.csv"), index=False)
+    for name, res in [('greedy', greedy_results), ('near_optimal', near_optimal_results),
+                      ('rwes_t', rwes_t_results), ('yomna', yomna_results)]:
+        if res is not None:
+            df = pd.DataFrame([res['average_kpis']])
+            df.to_csv(os.path.join(output_dir, f"{name}_strategy_kpis.csv"), index=False)
+    
+    # save anan results separately if not skipped
+    if anan_results is not None:
+        df = pd.DataFrame([anan_results['average_kpis']])
+        df.to_csv(os.path.join(output_dir, "anan_strategy_kpis.csv"), index=False)
     
     greedy_file = os.path.join(output_dir, "greedy_strategy_kpis.csv")
     near_optimal_file = os.path.join(output_dir, "near_optimal_strategy_kpis.csv")
@@ -1144,8 +1428,12 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         print(f"{'='*130}")
         print(f"\nKPI COMPARISON:")
         
-        # Header
-        header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Anan':<12} {'Yomna':<12} {'Best':<10}"
+        # Header - conditionally include Anan
+        has_anan = 'anan' in comparison
+        if has_anan:
+            header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Anan':<12} {'Yomna':<12} {'Best':<10}"
+        else:
+            header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Yomna':<12} {'Best':<10}"
         print(header)
         print("-" * len(header))
         
@@ -1154,19 +1442,20 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
                 'Greedy': comparison['greedy'][i],
                 'Near-Opt': comparison['near_optimal'][i],
                 'RWES_T': comparison['rwes_t'][i],
-                'Anan': comparison['anan'][i],
                 'Yomna': comparison['yomna'][i]
             }
+            if has_anan:
+                vals['Anan'] = comparison['anan'][i]
             
             # Identify best
-            # Lower is better: Cancellations, Waste, Cancellation Rate (including peak cancellation rate)
-            if 'Cancellation' in metric or ('Waste' in metric and 'Rate' not in metric):
+            # Lower is better: Cancellations, Waste (including customer waste and waste bags), Cancellation Rate (including peak cancellation rate), Churn Rate, Gini (fairness), Bounce Rate, Stores with Zero Orders, Cancellation Impact Ratio
+            if ('Cancellation' in metric and 'Impact' not in metric) or ('Waste' in metric and 'Rate' not in metric and 'Revenue' not in metric and 'Turnover' not in metric) or 'Customer Waste' in metric or 'Churn Rate' in metric or 'Gini' in metric or 'Bounce Rate' in metric or 'Zero Orders' in metric or 'Cancellation Impact Ratio' in metric:
                 best_val = min(vals.values())
             elif 'Supply-Demand Ratio' in metric:
                 # For supply-demand ratio, closer to 1.0 is better (balanced supply and demand)
                 best_val = min(vals.values(), key=lambda x: abs(x - 1.0))
             else:
-                # Higher is better: Revenue, Completed Orders, Fulfillment, Margin, Accuracy (including peak fulfillment)
+                # Higher is better: Revenue (including Net Revenue), Completed Orders, Fulfillment, Margin, Accuracy, Revenue per Waste Unit, Inventory Turnover, Repeat Purchase Rate
                 best_val = max(vals.values())
             
             best_strategies = [k for k, v in vals.items() if abs(v - best_val) < 0.001]
@@ -1174,23 +1463,35 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             
             # Format
             def fmt(v):
-                if 'Revenue' in metric or 'Customer' in metric and '$' in metric: return f"${v:.2f}"
+                if 'Revenue' in metric or ('Customer' in metric and '$' in metric) or 'Net Revenue' in metric: return f"${v:.2f}"
                 if 'Rate' in metric or 'Margin' in metric or '%' in metric: return f"{v:.2f}%"
                 if 'Accuracy' in metric: return f"{v:.3f}"
-                if 'Ratio' in metric: return f"{v:.3f}"
+                if 'Ratio' in metric or 'Gini' in metric: return f"{v:.3f}"
+                if 'Turnover' in metric: return f"{v:.2f}"
                 return f"{v:.1f}"
                 
-            row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Anan']):<12} {fmt(vals['Yomna']):<12} {best_str:<10}"
+            # Build row conditionally based on whether Anan is included
+            if has_anan:
+                row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Anan']):<12} {fmt(vals['Yomna']):<12} {best_str:<10}"
+            else:
+                row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Yomna']):<12} {best_str:<10}"
             print(row)
             
         
         print(f"\nOutput Files:")
-        print(f"  1. Strategy Comparison: {comparison_file}")
-        print(f"  2. Greedy Strategy KPIs: {greedy_file}")
-        print(f"  3. Near-Optimal Strategy KPIs: {near_optimal_file}")
-        print(f"  4. RWES_T Strategy KPIs: {rwes_t_file}")
-        print(f"  5. Anan Strategy KPIs: {os.path.join(output_dir, 'anan_strategy_kpis.csv')}")
-        print(f"  6. Yomna Strategy KPIs: {os.path.join(output_dir, 'yomna_strategy_kpis.csv')}")
+        file_num = 1
+        print(f"  {file_num}. Strategy Comparison: {comparison_file}")
+        file_num += 1
+        print(f"  {file_num}. Greedy Strategy KPIs: {greedy_file}")
+        file_num += 1
+        print(f"  {file_num}. Near-Optimal Strategy KPIs: {near_optimal_file}")
+        file_num += 1
+        print(f"  {file_num}. RWES_T Strategy KPIs: {rwes_t_file}")
+        file_num += 1
+        if has_anan:
+            print(f"  {file_num}. Anan Strategy KPIs: {os.path.join(output_dir, 'anan_strategy_kpis.csv')}")
+            file_num += 1
+        print(f"  {file_num}. Yomna Strategy KPIs: {os.path.join(output_dir, 'yomna_strategy_kpis.csv')}")
     
         print(f"{'='*130}\n")
     
@@ -1198,10 +1499,13 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         'greedy_results': greedy_results,
         'near_optimal_results': near_optimal_results,
         'rwes_t_results': rwes_t_results,
-        'anan_results': anan_results,
         'yomna_results': yomna_results,
         'comparison': comparison
     }
+    
+    # add anan results only if not skipped
+    if anan_results is not None:
+        results['anan_results'] = anan_results
 
 
 def run_50_day_simulation(num_stores: int = 10, num_customers: int = 100, n: Optional[int] = None,
@@ -1336,6 +1640,7 @@ def run_50_day_simulation(num_stores: int = 10, num_customers: int = 100, n: Opt
             'total_cancellations': day_results['total_cancellations'],
             'total_revenue': day_results['total_revenue'],
             'total_waste': day_results['total_waste'],
+            'total_waste_bags': day_results.get('total_waste_bags', day_results.get('total_waste', 0)),  # explicit count of waste bags
             'total_waste_monetary': day_results.get('total_waste_monetary', 0.0),
             'customer_satisfaction': day_results.get('customer_satisfaction', 0.0)
         }
@@ -1355,6 +1660,7 @@ def run_50_day_simulation(num_stores: int = 10, num_customers: int = 100, n: Opt
         'avg_total_cancellations': np.mean([k['total_cancellations'] for k in daily_kpis_list]),
         'avg_total_revenue': np.mean([k['total_revenue'] for k in daily_kpis_list]),
         'avg_total_waste': np.mean([k['total_waste'] for k in daily_kpis_list]),
+        'avg_total_waste_bags': np.mean([k.get('total_waste_bags', k.get('total_waste', 0)) for k in daily_kpis_list]),  # explicit count of waste bags
         'avg_total_waste_monetary': np.mean([k['total_waste_monetary'] for k in daily_kpis_list]),
         'avg_customer_satisfaction': np.mean([k['customer_satisfaction'] for k in daily_kpis_list]),
         'total_days': 10
@@ -1387,6 +1693,7 @@ def run_50_day_simulation(num_stores: int = 10, num_customers: int = 100, n: Opt
         print(f"  Average Cancellations per Day: {avg_kpis['avg_total_cancellations']:.1f}")
         print(f"  Average Revenue per Day: ${avg_kpis['avg_total_revenue']:.2f}")
         print(f"  Average Waste per Day: {avg_kpis['avg_total_waste']:.1f} units")
+        print(f"  Average Waste Bags per Day: {avg_kpis.get('avg_total_waste_bags', avg_kpis.get('avg_total_waste', 0)):.1f} bags")
         print(f"  Average Customer Satisfaction: {avg_kpis['avg_customer_satisfaction']*100:.1f}%")
         print(f"{'='*70}\n")
     
@@ -1451,6 +1758,7 @@ def run_simulations(num_stores: int = 10, num_customers: int = 100, n: Optional[
         print(f"Total Revenue: ${results['total_revenue']:.2f}")
         print(f"Total Cancellations: {results['total_cancellations']}")
         print(f"Total Waste: {results['total_waste']}")
+        print(f"Total Waste Bags: {results.get('total_waste_bags', results.get('total_waste', 0))}")
 
     return {
         'marketplace': marketplace,
@@ -1574,6 +1882,7 @@ class SimulationHarness:
             # Multi-day simulation: accumulate results
             cumulative_revenue = 0.0
             cumulative_waste = 0
+            cumulative_waste_bags = 0  # explicit count of waste bags
             cumulative_waste_monetary = 0.0
             cumulative_cancellations = 0
             cumulative_completed = 0
@@ -1594,6 +1903,7 @@ class SimulationHarness:
                 results = sim_output['results']
                 cumulative_revenue += results['total_revenue']
                 cumulative_waste += results['total_waste']
+                cumulative_waste_bags += results.get('total_waste_bags', results.get('total_waste', 0))  # explicit count of waste bags
                 cumulative_waste_monetary += results.get('total_waste_monetary', 0.0)
                 cumulative_cancellations += results['total_cancellations']
                 cumulative_completed += results['total_completed_orders']
@@ -1612,6 +1922,7 @@ class SimulationHarness:
                 'num_days': config.num_days,
                 'total_revenue': cumulative_revenue,
                 'total_waste': cumulative_waste,
+                'total_waste_bags': cumulative_waste_bags,  # explicit count of waste bags
                 'total_waste_monetary': cumulative_waste_monetary,
                 'total_cancellations': cumulative_cancellations,
                 'total_completed_orders': cumulative_completed,
@@ -1619,6 +1930,7 @@ class SimulationHarness:
                 'avg_revenue_per_order': cumulative_revenue / cumulative_completed if cumulative_completed > 0 else 0,
                 'avg_revenue_per_day': cumulative_revenue / config.num_days,
                 'avg_waste_per_day': cumulative_waste / config.num_days,
+                'avg_waste_bags_per_day': cumulative_waste_bags / config.num_days,  # explicit count of waste bags per day
                 'avg_waste_monetary_per_day': cumulative_waste_monetary / config.num_days,
                 'avg_cancellations_per_day': cumulative_cancellations / config.num_days
             }
@@ -1661,7 +1973,8 @@ class SimulationHarness:
                 })
             
             days_label = "day" if config.num_days == 1 else f"{config.num_days} days"
-            print(f"  Completed ({days_label}): Revenue=${kpis['total_revenue']:.2f}, Waste={kpis['total_waste']}, Cancellations={kpis['total_cancellations']}")
+            waste_bags = kpis.get('total_waste_bags', kpis.get('total_waste', 0))
+            print(f"  Completed ({days_label}): Revenue=${kpis['total_revenue']:.2f}, Waste={kpis['total_waste']} ({waste_bags} bags), Cancellations={kpis['total_cancellations']}")
             return kpis
             
         finally:
