@@ -952,3 +952,331 @@ class Yomna_Strategy(RankingStrategy):
         return [entry["store"] for entry in selected[:n]]
 
 
+@register_strategy("HybridElite")
+class HybridEliteStrategy(RankingStrategy):
+    """
+    Elite hybrid strategy combining the best of Near_Optimal, RWES_T, and Yomna.
+    
+    Key Improvements:
+    1. Better revenue optimization (direct price + rating, like RWES_T but enhanced)
+    2. Enhanced fulfillment rate (less aggressive filtering, better peak handling)
+    3. Improved profit margin (better cost/waste management)
+    4. Stronger fairness (exposure penalty like RWES_T)
+    5. Peak-time optimization (time-aware adjustments)
+    6. Better net revenue (optimize for actual revenue, not just risk-adjusted)
+    
+    Key Features:
+    1. Adaptive weights from Near_Optimal (market condition aware)
+    2. Hard reliability gates from Yomna (trust-first approach) - but less restrictive
+    3. Structured tier selection from Yomna (core/value/explore)
+    4. Reliability focus from RWES_T (35-40% weight on accuracy)
+    5. Efficiency optimization from RWES_T (revenue/waste ratio)
+    6. Supply-demand matching from Near_Optimal (predictive capacity)
+    7. Safety swaps from Yomna (risk mitigation)
+    8. Dynamic exploration from RWES_T (time-adaptive)
+    9. Exposure fairness penalty from RWES_T (logarithmic penalty)
+    10. Peak-time handling (time-of-day optimizations)
+    
+    Expected to outperform all individual strategies.
+    """
+    
+    def __init__(self, exploration_rate: float = 0.05, min_reliability: float = 0.45):
+        """
+        Args:
+            exploration_rate: Base exploration rate (will be adjusted dynamically)
+            min_reliability: Minimum accuracy score threshold (Yomna-style gate, lowered for better fulfillment)
+        """
+        self.exploration_rate = exploration_rate
+        self.min_reliability = min_reliability
+    
+    def select_stores(self, customer: Customer, n: int, all_stores: List[Restaurant], t: int = 0) -> List[Restaurant]:
+        """
+        Select stores using elite hybrid approach - ENHANCED VERSION.
+        """
+        if not all_stores:
+            return []
+        
+        # PHASE 1: Hard filtering (Yomna-style + RWES_T-style) - LESS AGGRESSIVE for better fulfillment
+        available = [s for s in all_stores if s.est_inventory > s.reservation_count]
+        if not available:
+            available = all_stores  # Fallback if no capacity
+        
+        if len(available) <= n:
+            return available[:n]
+        
+        # Normalization factors
+        max_price = max((s.price for s in all_stores), default=1.0)
+        max_price = max(max_price, 1.0)
+        min_price = min((s.price for s in all_stores), default=1.0)
+        max_inventory = max((s.est_inventory for s in all_stores), default=1.0)
+        total_stores = len(all_stores)
+        
+        # Calculate customer's favorite stores (personalization) - MORE AGGRESSIVE
+        order_counts = {}
+        for rid in customer.history.get('orders', []):
+            order_counts[rid] = order_counts.get(rid, 0) + 1
+        fav_ids = set([rid for rid, _ in sorted(order_counts.items(), key=lambda x: -x[1])][:4])  # Increased from 3 to 4
+        preferred_cats = customer.preferences.get('preferred_categories', [])
+        
+        # Calculate market conditions (Near_Optimal-style)
+        total_reservations = sum(s.reservation_count for s in all_stores)
+        total_capacity = sum(s.est_inventory for s in all_stores)
+        market_utilization = total_reservations / max(1.0, total_capacity)
+        
+        # Detect peak time (for peak fulfillment optimization)
+        # Peak time is when we're in the middle-high range of customer arrivals
+        peak_time_factor = min(1.0, max(0.0, (t / max(1.0, total_stores * 0.5)) - 0.3))  # 0.3 to 0.8 of day
+        is_peak_time = peak_time_factor > 0.5
+        
+        # PHASE 2: Adaptive weight calculation (ENHANCED - optimized for all metrics)
+        if market_utilization > 0.8:
+            # High demand: Focus on reliability and supply-demand, but also revenue
+            reliability_weight = 0.33  # Slightly reduced to allow revenue
+            supply_weight = 0.32  # Slightly reduced
+            revenue_weight = 0.18  # INCREASED from 0.12 for better revenue
+            efficiency_weight = 0.08
+            value_weight = 0.04
+            personalization_weight = 0.03
+            fairness_weight = 0.02
+        elif market_utilization < 0.3:
+            # Low demand: Focus on revenue and value
+            reliability_weight = 0.28  # Reduced to allow more revenue focus
+            supply_weight = 0.18  # Reduced - plenty of capacity
+            revenue_weight = 0.28  # INCREASED from 0.25 for better revenue
+            efficiency_weight = 0.10
+            value_weight = 0.10  # INCREASED from 0.08
+            personalization_weight = 0.05
+            fairness_weight = 0.01
+        else:
+            # Balanced: Optimal multi-objective - ENHANCED for better revenue
+            reliability_weight = 0.30  # Slightly reduced
+            supply_weight = 0.26  # Slightly reduced
+            revenue_weight = 0.22  # INCREASED from 0.18 for better revenue
+            efficiency_weight = 0.10
+            value_weight = 0.06
+            personalization_weight = 0.04
+            fairness_weight = 0.02
+        
+        # PHASE 3: Score calculation with gates (ENHANCED)
+        scored = []
+        
+        # Dynamic exploration weight (RWES_T-style)
+        exploration_weight = max(0.05, 1.0 - t / (len(all_stores) * 10))
+        
+        for store in available:
+            # Hard gates (Yomna-style) - LESS RESTRICTIVE for better fulfillment
+            reliability = store.accuracy_score
+            util = store.reservation_count / max(1.0, store.est_inventory)
+            
+            # Gate 1: Minimum reliability (LOWERED threshold)
+            if reliability < self.min_reliability:
+                continue
+            
+            # Gate 2: Conditional reliability (LESS STRICT - only exclude if very bad)
+            if reliability < 0.60 and util > 0.80:  # Changed from 0.70/0.70 to 0.60/0.80
+                continue
+            
+            # Gate 3: Overload protection (LESS STRICT)
+            if util > 0.98:  # Changed from 0.95 to 0.98
+                continue
+            
+            # Calculate score components
+            
+            # 1. RELIABILITY SCORE (RWES_T-style, 28-33% weight)
+            reliability_score = reliability
+            
+            # 2. SUPPLY-DEMAND SCORE (Near_Optimal-style, 18-32% weight)
+            safe_capacity = max(0, store.est_inventory - store.reservation_count)
+            safe_capacity_ratio = safe_capacity / max(1.0, max_inventory)
+            
+            optimal_utilization = 0.72  # Slightly adjusted
+            utilization_score = 1.0 - abs(util - optimal_utilization) / optimal_utilization
+            utilization_score = max(0.0, utilization_score)
+            
+            # Predictive demand (Near_Optimal-style)
+            expected_remaining_demand = max(0, (total_stores - t) * (1.0 / total_stores))
+            demand_supply_match = min(1.0, safe_capacity / max(1.0, expected_remaining_demand * store.est_inventory))
+            
+            supply_demand_score = (
+                0.4 * safe_capacity_ratio +
+                0.35 * utilization_score +
+                0.25 * demand_supply_match
+            )
+            
+            # 3. REVENUE SCORE (ENHANCED - direct like RWES_T but with rating boost)
+            # Use direct normalized price (like RWES_T) for better revenue
+            norm_price = store.price / max_price
+            rating_factor = store.rating / 5.0
+            
+            # Base revenue: direct price + rating (like RWES_T but enhanced)
+            base_revenue = norm_price * 0.6 + rating_factor * 0.4  # Price matters more
+            
+            # Risk adjustment (lighter than before to not over-penalize)
+            load_ratio = store.reservation_count / max(1.0, store.est_inventory)
+            base_cancel_prob = (1.0 - reliability) * load_ratio * 0.7  # Reduced impact
+            
+            # Time-of-day risk (lighter adjustment)
+            time_factor = min(1.0, t / max(1.0, total_stores * 0.8))
+            time_risk = time_factor * (1.0 - safe_capacity_ratio) * 0.2  # Reduced from 0.3
+            cancellation_prob = min(1.0, base_cancel_prob + time_risk)
+            fill_probability = 1.0 - cancellation_prob
+            
+            # Revenue score: base revenue with lighter risk adjustment
+            revenue_score = base_revenue * (0.7 + 0.3 * fill_probability)  # Less penalty for risk
+            
+            # 4. EFFICIENCY SCORE (RWES_T-style, 8-10% weight)
+            waste_potential = max(0.1, safe_capacity)
+            revenue_per_waste = base_revenue / waste_potential if waste_potential > 0 else 0
+            efficiency_score = min(1.0, revenue_per_waste / 100.0)
+            
+            # 5. VALUE PROPOSITION (Near_Optimal-style, 4-10% weight)
+            price_normalized = (store.price - min_price) / max(1.0, max_price - min_price)
+            value_score = (store.rating / 5.0) * (1.0 - price_normalized * 0.4)
+            
+            # 6. PERSONALIZATION (ENHANCED - stronger boost)
+            is_fav = 1.0 if store.restaurant_id in fav_ids else 0.0
+            cat_match = 1.0 if store.category in preferred_cats else 0.0
+            preference_rating = customer.preference_ratings.get(store.restaurant_id, 0.0)
+            personalization_score = 0.5 * is_fav + 0.3 * cat_match + 0.2 * preference_rating
+            
+            # 7. FAIRNESS (ENHANCED - use RWES_T-style exposure penalty)
+            if t > 0:
+                # Exposure deficit (Near_Optimal-style)
+                expected_exposure = t / total_stores
+                exposure_deficit = max(0, expected_exposure - store.exposure_count)
+                fairness_boost = min(1.0, exposure_deficit / max(1.0, expected_exposure))
+                
+                # Exposure penalty (RWES_T-style) - logarithmic penalty for over-exposure
+                exposure_penalty = exploration_weight * 0.08 * math.log1p(store.exposure_count)  # Increased from 0.05
+                
+                fairness_score = fairness_boost - exposure_penalty
+            else:
+                fairness_score = 1.0 / total_stores
+            
+            # 8. RISK PENALTY (lighter)
+            risk_penalty = cancellation_prob * (store.price / max_price) * (1.0 + time_risk * 0.5)  # Reduced impact
+            
+            # 9. PEAK-TIME BOOST (NEW - for peak fulfillment optimization)
+            peak_boost = 0.0
+            if is_peak_time:
+                # During peak, boost stores with high reliability and good capacity
+                if reliability > 0.75 and util < 0.75:
+                    peak_boost = 0.05 * (reliability * (1.0 - util))
+            
+            # Combine all components with adaptive weights
+            combined_score = (
+                reliability_weight * reliability_score +
+                supply_weight * supply_demand_score +
+                revenue_weight * revenue_score +
+                efficiency_weight * efficiency_score +
+                value_weight * value_score +
+                personalization_weight * personalization_score +
+                fairness_weight * fairness_score -
+                0.015 * risk_penalty +  # Reduced penalty
+                peak_boost  # Peak-time boost
+            )
+            
+            # Store metadata for tiered selection
+            scored.append({
+                "store": store,
+                "score": combined_score,
+                "value": value_score,
+                "novelty": (1.0 / (1.0 + store.exposure_count)) * min(1.0, max(0.6, reliability)),
+                "risk": risk_penalty,
+                "util": util,
+                "reliability": reliability,
+            })
+        
+        if not scored:
+            # Fallback: return top stores by basic score if all filtered out
+            return available[:n]
+        
+        # PHASE 4: Structured tier selection (Yomna-style) - ENHANCED
+        tier_sizes = {
+            "core": max(1, int(round(n * 0.4))),
+            "value": max(1, int(round(n * 0.3))),
+            "explore": max(1, n - max(1, int(round(n * 0.4))) - max(1, int(round(n * 0.3))))
+        }
+        
+        def sort_by_score(items):
+            return sorted(items, key=lambda x: (x["score"], x["store"].rating, -x["store"].price), reverse=True)
+        
+        def sort_by_value(items):
+            return sorted(items, key=lambda x: (x["value"], x["score"]), reverse=True)
+        
+        def sort_by_novelty(items):
+            return sorted(items, key=lambda x: (x["novelty"], x["score"]), reverse=True)
+        
+        selected = []
+        used_ids = set()
+        
+        # Core tier: High reliability + low utilization (LESS STRICT for better fulfillment)
+        core_candidates = [x for x in scored if x["reliability"] >= 0.75 and x["util"] < 0.85]  # Changed from 0.78/0.82
+        if not core_candidates:
+            core_candidates = [x for x in scored if x["reliability"] >= 0.70]  # Fallback
+        for entry in sort_by_score(core_candidates):
+            if len(selected) >= tier_sizes["core"]:
+                break
+            sid = entry["store"].restaurant_id
+            if sid not in used_ids:
+                selected.append(entry)
+                used_ids.add(sid)
+        
+        # Value tier: Best value + low risk
+        value_candidates = [x for x in scored if x["store"].restaurant_id not in used_ids and x["risk"] < 0.25]  # Less strict
+        for entry in sort_by_value(value_candidates):
+            if len(selected) >= tier_sizes["core"] + tier_sizes["value"]:
+                break
+            sid = entry["store"].restaurant_id
+            if sid not in used_ids:
+                selected.append(entry)
+                used_ids.add(sid)
+        
+        # Explore tier: Novelty + minimum reliability (LESS STRICT)
+        explore_candidates = [x for x in scored if x["store"].restaurant_id not in used_ids and x["reliability"] >= 0.60]  # Changed from 0.65
+        for entry in sort_by_novelty(explore_candidates):
+            if len(selected) >= tier_sizes["core"] + tier_sizes["value"] + tier_sizes["explore"]:
+                break
+            sid = entry["store"].restaurant_id
+            if sid not in used_ids:
+                selected.append(entry)
+                used_ids.add(sid)
+        
+        # Backfill if needed
+        if len(selected) < n:
+            remaining = [x for x in sort_by_score(scored) if x["store"].restaurant_id not in used_ids]
+            for entry in remaining:
+                if len(selected) >= n:
+                    break
+                selected.append(entry)
+                used_ids.add(entry["store"].restaurant_id)
+        
+        # PHASE 5: Safety swap (Yomna-style) - LESS AGGRESSIVE
+        if selected:
+            risky_idx, risky_entry = max(enumerate(selected), key=lambda x: x[1]["risk"])
+            if risky_entry["risk"] > 0.35:  # Changed from 0.30 to 0.35 (less aggressive)
+                alternatives = [
+                    x for x in sort_by_score(scored)
+                    if x["store"].restaurant_id not in used_ids
+                    and x["risk"] < 0.20  # Changed from 0.18
+                    and x["util"] < 0.80  # Changed from 0.78
+                    and x["score"] >= risky_entry["score"] - 0.15  # Changed from 0.12 (more flexible)
+                ]
+                if alternatives:
+                    best_alt = alternatives[0]
+                    used_ids.add(best_alt["store"].restaurant_id)
+                    selected[risky_idx] = best_alt
+        
+        # PHASE 6: Dynamic exploration (RWES_T-style) - ENHANCED
+        if selected and np.random.uniform() < (self.exploration_rate * exploration_weight * 1.2):  # Slightly more exploration
+            candidates = [
+                x for x in sort_by_novelty(scored)
+                if x["store"].restaurant_id not in used_ids
+                and x["reliability"] >= 0.65  # Changed from 0.70
+            ]
+            if candidates:
+                selected[-1] = candidates[0]
+        
+        return [entry["store"] for entry in selected[:n]]
+
+

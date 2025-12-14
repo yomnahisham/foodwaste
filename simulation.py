@@ -1158,7 +1158,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     """
     import pandas as pd
     import time
-    from ranking_algorithm import GreedyStrategy, NearOptimalStrategy, RWES_T_Strategy_Wrapper, Anan_Strategy, Yomna_Strategy
+    from ranking_algorithm import GreedyStrategy, NearOptimalStrategy, RWES_T_Strategy_Wrapper, Anan_Strategy, Yomna_Strategy, HybridEliteStrategy
     
     # Use time-based seed if not provided (ensures different results each run)
     if seed is None:
@@ -1271,12 +1271,13 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             (NearOptimalStrategy(exploration_rate=0.03), "NearOptimal", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
             (RWES_T_Strategy_Wrapper(), "RWES_T", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
             (Yomna_Strategy(), "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
+            (HybridEliteStrategy(exploration_rate=0.05, min_reliability=0.50), "HybridElite", stores, customers, n_value, duration, seed, output_dir, verbose, num_days),
         ]
         
         with Pool(min(4, cpu_count())) as pool:
             results = pool.map(run_strategy_wrapper, strategy_configs)
         
-        greedy_results, near_optimal_results, rwes_t_results, yomna_results = results
+        greedy_results, near_optimal_results, rwes_t_results, yomna_results, hybrid_elite_results = results
     else:
         # sequential execution (default, more reliable)
         if verbose:
@@ -1305,6 +1306,13 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     yomna_strategy = Yomna_Strategy()
     yomna_results = run_single_strategy_simulation(
             yomna_strategy, "Yomna_St", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
+        )
+    
+    if verbose:
+        print("\nRunning Hybrid Elite Strategy (Combining Best of All)...")
+    hybrid_elite_strategy = HybridEliteStrategy(exploration_rate=0.05, min_reliability=0.50)
+    hybrid_elite_results = run_single_strategy_simulation(
+            hybrid_elite_strategy, "HybridElite", stores, customers, n_value, duration, seed, output_dir, verbose, num_days
         )
     
     # anan strategy needs original customers/stores (not parallelizable easily)
@@ -1390,7 +1398,8 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         'greedy': calc_metrics(greedy_results),
         'near_optimal': calc_metrics(near_optimal_results),
         'rwes_t': calc_metrics(rwes_t_results),
-        'yomna': calc_metrics(yomna_results)
+        'yomna': calc_metrics(yomna_results),
+        'hybrid_elite': calc_metrics(hybrid_elite_results)
     }
     
     # add anan results only if not skipped
@@ -1408,7 +1417,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     
     # Save individual strategy KPIs
     for name, res in [('greedy', greedy_results), ('near_optimal', near_optimal_results),
-                      ('rwes_t', rwes_t_results), ('yomna', yomna_results)]:
+                      ('rwes_t', rwes_t_results), ('yomna', yomna_results), ('hybrid_elite', hybrid_elite_results)]:
         if res is not None:
             df = pd.DataFrame([res['average_kpis']])
             df.to_csv(os.path.join(output_dir, f"{name}_strategy_kpis.csv"), index=False)
@@ -1431,9 +1440,9 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         # Header - conditionally include Anan
         has_anan = 'anan' in comparison
         if has_anan:
-            header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Anan':<12} {'Yomna':<12} {'Best':<10}"
+            header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Anan':<12} {'Yomna':<12} {'Hybrid':<12} {'Best':<10}"
         else:
-            header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Yomna':<12} {'Best':<10}"
+            header = f"{'Metric':<40} {'Greedy':<12} {'Near-Opt':<12} {'RWES_T':<12} {'Yomna':<12} {'Hybrid':<12} {'Best':<10}"
         print(header)
         print("-" * len(header))
         
@@ -1442,7 +1451,8 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
                 'Greedy': comparison['greedy'][i],
                 'Near-Opt': comparison['near_optimal'][i],
                 'RWES_T': comparison['rwes_t'][i],
-                'Yomna': comparison['yomna'][i]
+                'Yomna': comparison['yomna'][i],
+                'Hybrid': comparison['hybrid_elite'][i]
             }
             if has_anan:
                 vals['Anan'] = comparison['anan'][i]
@@ -1472,9 +1482,9 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
                 
             # Build row conditionally based on whether Anan is included
             if has_anan:
-                row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Anan']):<12} {fmt(vals['Yomna']):<12} {best_str:<10}"
+                row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Anan']):<12} {fmt(vals['Yomna']):<12} {fmt(vals['Hybrid']):<12} {best_str:<10}"
             else:
-                row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Yomna']):<12} {best_str:<10}"
+                row = f"{metric:<40} {fmt(vals['Greedy']):<12} {fmt(vals['Near-Opt']):<12} {fmt(vals['RWES_T']):<12} {fmt(vals['Yomna']):<12} {fmt(vals['Hybrid']):<12} {best_str:<10}"
             print(row)
             
         
@@ -1492,6 +1502,8 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
             print(f"  {file_num}. Anan Strategy KPIs: {os.path.join(output_dir, 'anan_strategy_kpis.csv')}")
             file_num += 1
         print(f"  {file_num}. Yomna Strategy KPIs: {os.path.join(output_dir, 'yomna_strategy_kpis.csv')}")
+        file_num += 1
+        print(f"  {file_num}. Hybrid Elite Strategy KPIs: {os.path.join(output_dir, 'hybrid_elite_strategy_kpis.csv')}")
     
         print(f"{'='*130}\n")
     
@@ -1500,6 +1512,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         'near_optimal_results': near_optimal_results,
         'rwes_t_results': rwes_t_results,
         'yomna_results': yomna_results,
+        'hybrid_elite_results': hybrid_elite_results,
         'comparison': comparison
     }
     
