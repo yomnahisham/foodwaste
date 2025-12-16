@@ -1135,12 +1135,10 @@ def run_single_strategy_simulation(strategy, strategy_name: str, stores, custome
         'average_kpis': avg_kpis,
         'daily_kpis': daily_kpis_list
     }
-
-
 def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Optional[int] = None,
                       duration: float = 24.0, verbose: bool = True, seed: Optional[int] = None,
                       stores_csv: Optional[str] = None, customers_csv: Optional[str] = None,
-                      output_dir: str = "simulation_results", num_days: int = 10, 
+                      output_dir: str = "simulation_results", num_days: int = 10,
                       skip_anan: bool = False) -> Dict:
     """
     Run multi-day simulation with Greedy (baseline) and Near-Optimal strategies and compare KPIs.
@@ -1156,6 +1154,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         - near_optimal_results: Results from NearOptimalStrategy
         - comparison: Side-by-side KPI comparison
     """
+    print(f"DEBUG: compare_strategies called with num_days={num_days}")
     import pandas as pd
     import time
     from ranking_algorithm import GreedyStrategy, NearOptimalStrategy, RWES_T_Strategy_Wrapper, Anan_Strategy, Yomna_Strategy, Hybrid_Enhanced_Strategy
@@ -1171,6 +1170,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
         print("="*90)
         print()
     
+    # Load or generate stores
     # Load or generate stores
     stores = []
     if stores_csv and os.path.exists(stores_csv):
@@ -1196,7 +1196,7 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     else:
         if verbose:
             print(f"Generating {num_stores} stores...")
-    stores = load_store_data(num_stores, num_customers=num_customers, seed=seed)
+        stores = load_store_data(num_stores, num_customers=num_customers, seed=seed)
     
     num_stores = len(stores)
     
@@ -1239,8 +1239,8 @@ def compare_strategies(num_stores: int = 10, num_customers: int = 100, n: Option
     else:
         if verbose:
             print(f"Generating {num_customers} customers...")
-    arrival_times = sorted(np.random.uniform(0, duration, num_customers))
-    customers = generate_customer(num_customers, arrival_times, seed=seed)
+        arrival_times = sorted(np.random.uniform(0, duration, num_customers))
+        customers = generate_customer(num_customers, arrival_times, seed=seed)
     
     num_customers = len(customers)
     
