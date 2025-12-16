@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import {
   LineChart,
@@ -380,7 +380,10 @@ function App() {
                     />
                     <KPICard
                       title="Lowest Waste"
-                      value={getMinMetric(results.comparison, 'Waste Bags')}
+                      value={getMinMetric(
+                        results.comparison,
+                        'Waste Bags'
+                      )}
                       icon={<Trash2 size={28} className="text-white" />}
                       gradient="from-rose-400 to-rose-600"
                       glow="shadow-rose-400/40"
@@ -512,7 +515,7 @@ function App() {
               </div>
 
               {/* Bar comparison */}
-              <div className="bg-white/95 backdrop-blur-lg p-8 rounded-2xl shadow-xl border border-slate-100 transition-all duration-300 hover:shadow-2xl hover:-translate-y-0.5">
+              <div className="bg-white/95 backdrop-blur-lg p-8 rounded-2xl shadow-xl border border-slate-100 transition-all duration-300 hover:shadow-2xl hover:-translate-y-0.5 text-slate-800">
                 <div className="mb-6 flex flex-col md:flex-row md:items-end md:justify-between gap-3">
                   <div>
                     <h3 className="text-xl font-bold text-slate-800 mb-1">
@@ -537,6 +540,8 @@ function App() {
                       data={formatComparisonData(results)}
                       barSize={40}
                       margin={{ top: 20, right: 30, left: 20, bottom: 5 }}
+                      role="img"
+                      aria-label="Bar chart comparing average revenue and average waste bags per strategy"
                     >
                       <CartesianGrid
                         strokeDasharray="3 3"
@@ -576,7 +581,12 @@ function App() {
                           backgroundColor: 'rgba(255,255,255,0.96)',
                         }}
                       />
-                      <Legend wrapperStyle={{ paddingTop: '20px' }} />
+                      <Legend
+                        wrapperStyle={{
+                          paddingTop: '20px',
+                          color: '#64748b',
+                        }}
+                      />
                       <Bar
                         yAxisId="left"
                         dataKey="revenue"
@@ -601,13 +611,13 @@ function App() {
                         >
                           <stop
                             offset="0%"
-                            stopColor="#4ade80"
-                            stopOpacity={1}
+                            stopColor="#22c55e"
+                            stopOpacity={0.95}
                           />
                           <stop
                             offset="100%"
-                            stopColor="#22c55e"
-                            stopOpacity={0.8}
+                            stopColor="#16a34a"
+                            stopOpacity={0.85}
                           />
                         </linearGradient>
                         <linearGradient
@@ -619,13 +629,13 @@ function App() {
                         >
                           <stop
                             offset="0%"
-                            stopColor="#f87171"
-                            stopOpacity={1}
+                            stopColor="#f97373"
+                            stopOpacity={0.95}
                           />
                           <stop
                             offset="100%"
                             stopColor="#ef4444"
-                            stopOpacity={0.8}
+                            stopOpacity={0.85}
                           />
                         </linearGradient>
                       </defs>
@@ -892,16 +902,35 @@ const ControlPanel = ({
   </div>
 );
 
+/* Keyboard‑accessible chart card */
 const ChartCard = ({ title, badge, badgeColor, onClick, children }) => {
   const badgeBg =
     badgeColor === 'emerald'
       ? 'bg-emerald-100 text-emerald-700'
       : 'bg-rose-100 text-rose-700';
 
+  const handleKeyDown = (e) => {
+    if (!onClick) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onClick();
+    }
+  };
+
+  const clickableProps = onClick
+    ? {
+        role: 'button',
+        tabIndex: 0,
+        'aria-label': `Expand ${title} chart`,
+        onKeyDown: handleKeyDown,
+      }
+    : {};
+
   return (
     <div
+      {...clickableProps}
       onClick={onClick}
-      className={`bg-white/90 backdrop-blur-md p-6 rounded-2xl shadow-xl border border-slate-100 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-2xl ${
+      className={`bg-white/90 backdrop-blur-md p-6 rounded-2xl shadow-xl border border-slate-100 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 ${
         onClick ? 'cursor-zoom-in' : ''
       }`}
     >
@@ -918,6 +947,7 @@ const ChartCard = ({ title, badge, badgeColor, onClick, children }) => {
   );
 };
 
+/* Insights panel */
 const InsightsPanel = ({ insights, primaryStrategy }) => (
   <div className="bg-slate-900/85 rounded-2xl border border-slate-800 shadow-2xl shadow-black/40 p-6 backdrop-blur flex flex-col gap-4 transition-all duration-300 hover:shadow-emerald-500/30 hover:-translate-y-0.5">
     <h3 className="text-lg font-semibold text-slate-50 flex items-center gap-2">
@@ -974,7 +1004,16 @@ const InsightsPanel = ({ insights, primaryStrategy }) => (
   </div>
 );
 
+/* Accessible modal */
 const ChartModal = ({ open, onClose, type, data, primaryStrategy }) => {
+  const closeBtnRef = useRef(null);
+
+  useEffect(() => {
+    if (open && closeBtnRef.current) {
+      closeBtnRef.current.focus();
+    }
+  }, [open]);
+
   if (!open) return null;
 
   const isRevenue = type === 'revenue';
@@ -984,19 +1023,37 @@ const ChartModal = ({ open, onClose, type, data, primaryStrategy }) => {
   const badge = isRevenue ? 'Total revenue per day' : 'Total waste bags per day';
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
+    <div
+      className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="chart-modal-title"
+      aria-describedby="chart-modal-desc"
+    >
       <div className="absolute inset-0" onClick={onClose} />
       <div className="relative z-50 w-full max-w-5xl mx-4 bg-slate-950/95 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden transform transition-all duration-200 scale-100">
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-900/80">
           <div>
-            <h2 className="text-lg font-semibold text-slate-50">{title}</h2>
-            <p className="text-xs text-slate-400 mt-1">
-              Click outside or press Esc to return to the dashboard.
+            <h2
+              id="chart-modal-title"
+              className="text-lg font-semibold text-slate-50"
+            >
+              {title}
+            </h2>
+            <p
+              id="chart-modal-desc"
+              className="text-xs text-slate-400 mt-1"
+            >
+              Click outside the panel or press Escape to return to the
+              dashboard.
             </p>
           </div>
           <button
+            ref={closeBtnRef}
             onClick={onClose}
-            className="rounded-full p-1.5 hover:bg-slate-800 text-slate-300"
+            className="rounded-full p-1.5 hover:bg-slate-800 text-slate-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+            aria-label="Close chart"
+            type="button"
           >
             <X size={18} />
           </button>
@@ -1092,7 +1149,9 @@ const Toast = ({ message, type, onClose }) => {
 
 const KPICard = ({ title, value, icon, gradient, glow }) => (
   <div
-    className={`bg-gradient-to-br ${gradient} p-6 rounded-2xl shadow-xl ${glow} text-white flex items-center justify-between transition-transform duration-200 hover:scale-[1.02]`}
+    className={`bg-gradient-to-br ${gradient} p-6 rounded-2xl shadow-xl ${glow} text-white flex items-center justify-between transition-transform duration-200 hover:scale-[1.02] focus-within:ring-2 focus-within:ring-white/70`}
+    role="group"
+    aria-label={title}
   >
     <div>
       <div className="text-white/80 font-medium mb-1 text-sm">
@@ -1106,8 +1165,14 @@ const KPICard = ({ title, value, icon, gradient, glow }) => (
   </div>
 );
 
+/* Case‑insensitive metric lookup */
+const findMetricIndex = (comp, keyword) =>
+  comp.metric.findIndex((m) =>
+    m.toLowerCase().includes(keyword.toLowerCase())
+  );
+
 const getMinMetric = (comp, keyword) => {
-  const idx = comp.metric.findIndex((m) => m.includes(keyword));
+  const idx = findMetricIndex(comp, keyword);
   if (idx === -1) return '-';
   const vals = [
     comp.greedy[idx],
@@ -1120,7 +1185,7 @@ const getMinMetric = (comp, keyword) => {
 };
 
 const getMaxMetric = (comp, keyword, isMoney = true) => {
-  const idx = comp.metric.findIndex((m) => m.includes(keyword));
+  const idx = findMetricIndex(comp, keyword);
   if (idx === -1) return '-';
   const vals = [
     comp.greedy[idx],
@@ -1134,7 +1199,7 @@ const getMaxMetric = (comp, keyword, isMoney = true) => {
 };
 
 const getBestStrategyByMetric = (comp, keyword, type = 'max') => {
-  const idx = comp.metric.findIndex((m) => m.includes(keyword));
+  const idx = findMetricIndex(comp, keyword);
   if (idx === -1) return null;
 
   const entries = [
@@ -1152,7 +1217,11 @@ const getBestStrategyByMetric = (comp, keyword, type = 'max') => {
 };
 
 const deriveInsights = (comp, primaryStrategy) => {
-  const bestRevenue = getBestStrategyByMetric(comp, 'Revenue per Day', 'max');
+  const bestRevenue = getBestStrategyByMetric(
+    comp,
+    'Revenue per Day',
+    'max'
+  );
   const bestWaste = getBestStrategyByMetric(
     comp,
     'Waste Bags per Day',
@@ -1160,12 +1229,8 @@ const deriveInsights = (comp, primaryStrategy) => {
   );
   if (!bestRevenue || !bestWaste) return null;
 
-  const revIdx = comp.metric.findIndex((m) =>
-    m.includes('Revenue per Day')
-  );
-  const wasteIdx = comp.metric.findIndex((m) =>
-    m.includes('Waste Bags per Day')
-  );
+  const revIdx = findMetricIndex(comp, 'Revenue per Day');
+  const wasteIdx = findMetricIndex(comp, 'Waste Bags per Day');
 
   const greedyRev = comp.greedy[revIdx];
   const greedyWaste = comp.greedy[wasteIdx];
@@ -1192,12 +1257,8 @@ const deriveInsights = (comp, primaryStrategy) => {
 
 const formatComparisonData = (results) => {
   const comp = results.comparison;
-  const revIdx = comp.metric.findIndex((m) =>
-    m.includes('Revenue per Day')
-  );
-  const wasteIdx = comp.metric.findIndex((m) =>
-    m.includes('Waste Bags per Day')
-  );
+  const revIdx = findMetricIndex(comp, 'Revenue per Day');
+  const wasteIdx = findMetricIndex(comp, 'Waste Bags per Day');
   if (revIdx === -1 || wasteIdx === -1) return [];
 
   return [
