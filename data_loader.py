@@ -75,6 +75,7 @@ def load_stores_from_csv(csv_path: str = "stores.csv") -> List[Restaurant]:
         restaurant.price = float(row['price'])
         restaurant.rating = float(row['average_overall_rating'])
         restaurant.est_inventory = int(row[inventory_col])
+        restaurant.target_daily_inventory = restaurant.est_inventory
         
         # Store location (for potential future use)
         restaurant.longitude = float(row['longitude'])

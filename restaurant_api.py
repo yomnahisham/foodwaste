@@ -29,6 +29,7 @@ class Restaurant:
         self.number_of_ratings = 0
 
         self.est_inventory = 0
+        self.target_daily_inventory = 0  # Planned production for the day
         self.actual_inventory = 0
 
         self.accuracy_score = 1.0
@@ -229,52 +230,34 @@ class Restaurant:
 
     def update_inventory_estimate(self, learning_window_days: int = 10):
         """
-        adaptively update inventory estimate based on recent accuracy performance.
-        stores learn from their mistakes and adjust estimates over time.
-        
-        if consistently overestimating (actual < est): reduce estimates
-        if consistently underestimating (actual > est): increase estimates
-        learning rate based on accuracy_score (better stores learn faster)
+        Update production plan (target_daily_inventory) based on demand and waste.
+        If sold out, increase production. If high waste, decrease production.
         """
-        if len(self.inventory_history) < 3:
-            # not enough history to learn from
-            return
+        if not hasattr(self, 'target_daily_inventory') or self.target_daily_inventory <= 0:
+            self.target_daily_inventory = max(1, self.est_inventory)
+            
+        # Calculate utilization of the PLANNED inventory
+        # (Use target because est might have been reduced midday)
+        utilization = self.reservation_count / max(1, self.target_daily_inventory)
         
-        # look at recent history (last learning_window_days days)
-        recent_history = self.inventory_history[-learning_window_days:]
-        if len(recent_history) < 3:
-            recent_history = self.inventory_history[-3:]
+        # Calculate actual waste
+        # Note: bag doubling logic might complicate waste calculation, so we use
+        # the simple proxy: actual - reservations
+        waste_count = max(0, self.actual_inventory - self.completed_order_count)
+        waste_ratio = waste_count / max(1, self.actual_inventory)
         
-        # calculate average error direction
-        overestimates = 0
-        underestimates = 0
-        total_days = len(recent_history)
+        # Adaptive Production Logic
+        if utilization >= 0.90:
+             # Sold out or nearly sold out - Increase production
+             # Growth is aggressive (15%) to capture demand quickly
+             self.target_daily_inventory = int(self.target_daily_inventory * 1.15) + 1
+        elif waste_ratio > 0.25:
+             # High waste - Decrease production
+             # Shrinkage is moderate (10%) to avoid over-correction
+             self.target_daily_inventory = int(self.target_daily_inventory * 0.90)
         
-        for date, est, actual in recent_history:
-            if est > 0:
-                if actual < est:
-                    overestimates += 1
-                elif actual > est:
-                    underestimates += 1
-        
-        # determine if we need to adjust
-        overestimate_ratio = overestimates / total_days if total_days > 0 else 0
-        underestimate_ratio = underestimates / total_days if total_days > 0 else 0
-        
-        # learning rate: better stores (higher accuracy) learn faster
-        # accuracy_score ranges 0-1, so learning rate ranges 0.1-0.3
-        base_learning_rate = 0.15
-        learning_rate = base_learning_rate + (self.accuracy_score * 0.15)  # 0.15 to 0.30
-        
-        # adjust estimate based on pattern
-        if overestimate_ratio > 0.6:
-            # consistently overestimating - reduce estimate
-            adjustment = -learning_rate * self.est_inventory
-            self.est_inventory = max(1, int(self.est_inventory + adjustment))
-        elif underestimate_ratio > 0.6:
-            # consistently underestimating - increase estimate
-            adjustment = learning_rate * self.est_inventory
-            self.est_inventory = max(1, int(self.est_inventory + adjustment))
+        # Ensure minimum inventory
+        self.target_daily_inventory = max(3, self.target_daily_inventory)
 
     def reset_daily_counters(self):
         """Reset daily counters for a new day"""
@@ -318,6 +301,7 @@ def load_store_data(num_stores: int = 10, num_customers: int = 100, seed: int = 
         min_inv = max(2, int(avg_inventory_per_store * 0.5))
         max_inv = int(avg_inventory_per_store * 1.5)
         restaurant.est_inventory = np.random.randint(min_inv, max_inv + 1)
+        restaurant.target_daily_inventory = restaurant.est_inventory
         
         # Wider accuracy range - some stores are very inaccurate
         restaurant.accuracy_score = np.random.uniform(0.5, 1.0)  # Some stores are only 50% accurate
@@ -403,7 +387,37 @@ def initialize_day(stores: List[Restaurant], actual_inventories: Optional[Dict[i
 
     for store in stores:
         store.reset_daily_counters()
-        # actual_inventory remains 0 until end of day when it's revealed
+        
+        # Reset estimated inventory to the daily production target
+        # This prevents the "Death Spiral" where midday adjustments permenantly reduce capacity
+        if hasattr(store, 'target_daily_inventory') and store.target_daily_inventory > 0:
+            store.est_inventory = store.target_daily_inventory
+        
+        # Initialize actual_inventory (hidden from store until end of day)
+        # We generate this at start of day based on production accuracy
+        if _actual_inventories_for_day and store.restaurant_id in _actual_inventories_for_day:
+            store.actual_inventory = _actual_inventories_for_day[store.restaurant_id]
+        else:
+            # Generate actual inventory based on accuracy
+            accuracy_factor = store.accuracy_score
+            max_error = 0.5 * (1.0 - accuracy_factor)
+            
+            if accuracy_factor > 0.8:
+                will_underestimate = np.random.uniform() < 0.5
+            else:
+                will_underestimate = np.random.uniform() < 0.6
+            
+            if will_underestimate:
+                min_pct = max(0.5, 1.0 - max_error)
+                max_pct = 0.95
+                factor = np.random.uniform(min_pct, max_pct)
+            else:
+                min_pct = 1.0
+                max_pct = 1.0 + max_error
+                factor = np.random.uniform(min_pct, max_pct)
+            
+            actual = int(store.est_inventory * factor)
+            store.actual_inventory = max(0, actual)
 
 def calculate_gini_coefficient(values: List[float]) -> float:
     """
@@ -492,31 +506,8 @@ def end_of_day_processing_enhanced(marketplace: Optional["Marketplace"] = None, 
         stores_to_process = list(_stores.values())
 
     for store in stores_to_process:
-        # discover the actual inventory (same as original)
-        if _actual_inventories_for_day and store.restaurant_id in _actual_inventories_for_day:
-            store.actual_inventory = _actual_inventories_for_day[store.restaurant_id]
-        else:
-            # generate actual inventory based on accuracy
-            accuracy_factor = store.accuracy_score
-            max_error = 0.5 * (1.0 - accuracy_factor)
-            
-            if accuracy_factor > 0.8:
-                will_underestimate = np.random.uniform() < 0.5
-            else:
-                will_underestimate = np.random.uniform() < 0.6
-            
-            if will_underestimate:
-                min_pct = max(0.5, 1.0 - max_error)
-                max_pct = 0.95
-                factor = np.random.uniform(min_pct, max_pct)
-            else:
-                min_pct = 1.0
-                max_pct = 1.0 + max_error
-                factor = np.random.uniform(min_pct, max_pct)
-            
-            # For simulated stores, est_inventory might be updated by initialize_day
-            actual = int(store.est_inventory * factor)
-            store.actual_inventory = max(0, actual)
+        # actual_inventory is already set by initialize_day at the start of the day
+        # we now just reveal it and calculate results
         
         # calculate cancellations with bag doubling logic
         # if actual > estimated, restaurant can double bag capacity
