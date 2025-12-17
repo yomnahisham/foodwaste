@@ -26,7 +26,7 @@ import {
   ChevronDown,
 } from 'lucide-react';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = import.meta.env.PROD ? '' : 'http://localhost:8000';
 const STRATEGIES = ['Greedy', 'Near-Opt', 'RWES_T', 'Yomna', 'Hybrid'];
 
 function App() {

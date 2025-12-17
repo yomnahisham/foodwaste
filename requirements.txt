@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+numpy
+pandas
+python-multipart
+# Add other dependencies if your simulation uses them, e.g. scipy, scikit-learn
+# checks:
+# requests (if used)
